@@ -92,6 +92,9 @@ extension AppCommand {
         case .resizeDown:
             guard let projectID else { return nil }
             return { ctx.appState.resizePane(.down, projectID: projectID) }
+        case .equalizeSplits:
+            guard let projectID else { return nil }
+            return { ctx.appState.equalizeSplits(projectID: projectID) }
         case .openProject:
             return { _ = ctx.appState.openProject(store: ctx.projectStore) }
         case .renameProject:

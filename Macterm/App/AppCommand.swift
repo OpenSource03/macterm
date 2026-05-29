@@ -29,6 +29,7 @@ enum AppCommand: String, CaseIterable, Identifiable {
     case resizeRight
     case resizeUp
     case resizeDown
+    case equalizeSplits
     // Projects
     case openProject
     case renameProject
@@ -71,6 +72,7 @@ enum AppCommand: String, CaseIterable, Identifiable {
         case .resizeRight: "Resize Pane Right"
         case .resizeUp: "Resize Pane Up"
         case .resizeDown: "Resize Pane Down"
+        case .equalizeSplits: "Equalize Splits"
         case .openProject: "Open Project"
         case .renameProject: "Rename Current Project"
         case .unloadProject: "Unload Current Project"
@@ -110,7 +112,8 @@ enum AppCommand: String, CaseIterable, Identifiable {
              .resizeLeft,
              .resizeRight,
              .resizeUp,
-             .resizeDown: .panes
+             .resizeDown,
+             .equalizeSplits: .panes
         case .openProject,
              .renameProject,
              .unloadProject,
@@ -152,6 +155,7 @@ enum AppCommand: String, CaseIterable, Identifiable {
         case .resizeRight: .resizePaneRight
         case .resizeUp: .resizePaneUp
         case .resizeDown: .resizePaneDown
+        case .equalizeSplits: .equalizeSplits
         case .openProject: .openProject
         case .nextProject: .nextProject
         case .previousProject: .previousProject

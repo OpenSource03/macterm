@@ -163,6 +163,12 @@ final class TerminalTab: Identifiable {
         return true
     }
 
+    /// Reset every split ratio so all panes share space evenly — the same
+    /// tiling `autoTilingEnabled` applies automatically, available on demand.
+    func equalizeSplits() {
+        splitRoot.rebalanced()
+    }
+
     /// Remove a pane from the tree. Returns `.onlyPaneLeft` if the caller should
     /// close the whole tab (the pane was the last one), otherwise `.removed`.
     /// The pane's surface is destroyed in both cases.
