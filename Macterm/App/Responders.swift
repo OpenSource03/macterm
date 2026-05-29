@@ -89,6 +89,10 @@ final class QuickTerminalResponder: KeyResponder {
             state.resize(dir)
             return .handled
         }
+        if HotkeyRegistry.matches(event, action: .equalizeSplits) {
+            state.splitRoot.rebalanced()
+            return .handled
+        }
 
         return .passThrough
     }
@@ -218,6 +222,12 @@ final class MainAppResponder: KeyResponder {
         if let (_, dir) = Self.resizeActions.first(where: { HotkeyRegistry.matches(event, action: $0.0) }) {
             guard let projectID = appState.activeProjectID else { return .passThrough }
             appState.resizePane(dir, projectID: projectID)
+            return .handled
+        }
+
+        if HotkeyRegistry.matches(event, action: .equalizeSplits) {
+            guard let projectID = appState.activeProjectID else { return .passThrough }
+            appState.equalizeSplits(projectID: projectID)
             return .handled
         }
 

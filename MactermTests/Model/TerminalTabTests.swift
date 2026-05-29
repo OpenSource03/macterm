@@ -105,6 +105,44 @@ struct TerminalTabTests {
         }
     }
 
+    // MARK: - equalizeSplits
+
+    @Test
+    func equalizeSplits_resets_lopsided_ratio_to_even() {
+        let (tab, _) = makeTab(H(pane("a"), pane("b"), ratio: 0.2))
+        tab.equalizeSplits()
+        if case let .split(b) = tab.splitRoot {
+            #expect(abs(b.ratio - 0.5) < 0.0001)
+        } else {
+            Issue.record("expected split root")
+        }
+    }
+
+    @Test
+    func equalizeSplits_distributes_same_axis_panes_evenly() {
+        // H(a, H(b, c)) — outer should become 1/3, inner 1/2 so all three
+        // panes end up the same width.
+        let (tab, _) = makeTab(H(pane("a"), H(pane("b"), pane("c")), ratio: 0.8))
+        tab.equalizeSplits()
+        if case let .split(b) = tab.splitRoot {
+            #expect(abs(b.ratio - (1.0 / 3.0)) < 0.0001)
+            if case let .split(inner) = b.second {
+                #expect(abs(inner.ratio - 0.5) < 0.0001)
+            } else {
+                Issue.record("expected inner split preserved")
+            }
+        } else {
+            Issue.record("expected split root")
+        }
+    }
+
+    @Test
+    func equalizeSplits_on_single_pane_is_noop() {
+        let (tab, ids) = makeTab(pane("a"))
+        tab.equalizeSplits()
+        #expect(render(tab.splitRoot, ids: ids) == "a")
+    }
+
     // MARK: - removePane
 
     @Test

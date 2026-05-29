@@ -253,6 +253,11 @@ final class AppState {
         saveWorkspaces()
     }
 
+    func equalizeSplits(projectID: UUID) {
+        workspaces[projectID]?.activeTab?.equalizeSplits()
+        saveWorkspaces()
+    }
+
     func toggleZoom(projectID: UUID) {
         guard let tab = workspaces[projectID]?.activeTab,
               let paneID = tab.focusedPaneID
