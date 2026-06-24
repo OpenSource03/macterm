@@ -6,7 +6,7 @@ import Testing
 struct WorkspaceSerializerTests {
     // Round-trip: snapshot -> restore -> compare topology.
     private func roundTrip(_ workspaces: [UUID: Workspace]) -> [Workspace] {
-        let snaps = WorkspaceSerializer.snapshot(workspaces)
+        let snaps = WorkspaceSerializer.snapshot(workspaces).workspaces
         let valid = Set(workspaces.keys)
         return WorkspaceSerializer.restore(from: snaps, validIDs: valid)
     }
@@ -81,7 +81,7 @@ struct WorkspaceSerializerTests {
     func round_trip_falls_back_to_first_tab_when_active_missing() {
         // Simulate a corrupt snapshot where activeTabID doesn't match any tab.
         let ws = Workspace(projectID: UUID(), projectPath: "/tmp")
-        let snaps = WorkspaceSerializer.snapshot([ws.projectID: ws])
+        let snaps = WorkspaceSerializer.snapshot([ws.projectID: ws]).workspaces
         var snap = snaps[0]
         snap = WorkspaceSnapshot(projectID: snap.projectID, activeTabID: UUID(), tabs: snap.tabs)
         let restored = WorkspaceSerializer.restore(from: [snap], validIDs: [ws.projectID])
@@ -94,7 +94,7 @@ struct WorkspaceSerializerTests {
     func restore_skips_workspaces_for_removed_projects() {
         let kept = Workspace(projectID: UUID(), projectPath: "/tmp/a")
         let dropped = Workspace(projectID: UUID(), projectPath: "/tmp/b")
-        let snaps = WorkspaceSerializer.snapshot([kept.projectID: kept, dropped.projectID: dropped])
+        let snaps = WorkspaceSerializer.snapshot([kept.projectID: kept, dropped.projectID: dropped]).workspaces
         let restored = WorkspaceSerializer.restore(from: snaps, validIDs: [kept.projectID])
         #expect(restored.count == 1)
         #expect(restored[0].projectID == kept.projectID)
@@ -116,7 +116,7 @@ struct WorkspaceSerializerTests {
         let (tree, ids) = build(H(pane("a"), pane("b")))
         tab.splitRoot = tree
         tab.focusedPaneID = ids["b"]
-        let snaps = WorkspaceSerializer.snapshot([ws.projectID: ws])
+        let snaps = WorkspaceSerializer.snapshot([ws.projectID: ws]).workspaces
         #expect(snaps[0].tabs[0].focusedPaneID == ids["b"])
     }
 
@@ -180,13 +180,75 @@ struct WorkspaceSerializerTests {
         let (tree, _) = build(H(pane("a"), pane("b")))
         ws.tabs[0].splitRoot = tree
 
-        store.save(WorkspaceSerializer.snapshot([ws.projectID: ws]))
+        let snap = WorkspaceSerializer.snapshot([ws.projectID: ws])
+        store.save(workspaces: snap.workspaces, groups: snap.groups)
         let reloaded = store.load()
-        #expect(reloaded.count == 1)
-        #expect(reloaded[0].projectID == ws.projectID)
+        #expect(reloaded.workspaces.count == 1)
+        #expect(reloaded.workspaces[0].projectID == ws.projectID)
 
-        let restored = WorkspaceSerializer.restore(from: reloaded, validIDs: [ws.projectID])
+        let restored = WorkspaceSerializer.restore(from: reloaded.workspaces, validIDs: [ws.projectID])
         #expect(restored[0].tabs[0].splitRoot.allPanes().count == 2)
+    }
+
+    // MARK: - Linked groups
+
+    @Test
+    func round_trip_restores_linked_group_across_projects() throws {
+        // Two single-pane projects; splice p2's tab into p1's tab to mimic a
+        // cross-project link, then round-trip through disk.
+        let p1 = UUID()
+        let p2 = UUID()
+        let ws1 = Workspace(projectID: p1, projectPath: "/tmp1")
+        let ws2 = Workspace(projectID: p2, projectPath: "/tmp2")
+        let host = ws1.tabs[0]
+        let member = ws2.tabs[0]
+        let hostPaneID = try #require(host.focusedPaneID)
+
+        let subtree = member.splitRoot
+        subtree.assignOriginTab(member.id)
+        let (root, seam) = host.splitRoot.splicing(subtree: subtree, atPaneID: hostPaneID, edge: .right)
+        #expect(seam != nil)
+        host.splitRoot = root
+
+        let group = TabGroup(hostTabID: host.id, colorIndex: 2)
+        group.memberOrder = [host.id, member.id]
+        host.linkedGroupID = group.id
+        member.linkedGroupID = group.id
+
+        let workspaces = [p1: ws1, p2: ws2]
+        let snap = WorkspaceSerializer.snapshot(workspaces, groups: [group.id: group])
+
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("macterm-tests-group-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let store = WorkspaceStore(fileURL: tmp)
+        store.save(workspaces: snap.workspaces, groups: snap.groups)
+
+        let loaded = store.load()
+        let restoredWorkspaces = WorkspaceSerializer.restore(from: loaded.workspaces, validIDs: [p1, p2])
+        var byProject: [UUID: Workspace] = [:]
+        for ws in restoredWorkspaces {
+            byProject[ws.projectID] = ws
+        }
+        let (groups, nextColor) = WorkspaceSerializer.restoreGroups(loaded.groups, into: byProject)
+
+        #expect(groups.count == 1)
+        #expect(nextColor == 3)
+        let restoredGroup = try #require(groups[group.id])
+        #expect(restoredGroup.memberOrder == [host.id, member.id])
+
+        let restoredHost = try #require(byProject[p1]?.tabs.first { $0.id == host.id })
+        #expect(restoredHost.splitRoot.allPanes().count == 2)
+        // Pane ids are regenerated on restore, but origin tags survive — find the
+        // member's pane by origin and check it kept its own project identity.
+        let memberPane = restoredHost.splitRoot.allPanes().first { $0.originTabID == member.id }
+        #expect(memberPane != nil)
+        #expect(memberPane?.projectID == p2)
+
+        let restoredMember = try #require(byProject[p2]?.tabs.first { $0.id == member.id })
+        #expect(restoredMember.linkedGroupID == group.id)
+        #expect(restoredMember.splitRoot.allPanes().count == 1)
+        #expect(restoredMember.splitRoot.allPanes().first?.originTabID == member.id)
     }
 
     @Test
@@ -228,7 +290,7 @@ struct WorkspaceSerializerTests {
         let tmp = FileManager.default.temporaryDirectory
             .appendingPathComponent("macterm-tests-doesnotexist-\(UUID().uuidString).json")
         let store = WorkspaceStore(fileURL: tmp)
-        #expect(store.load().isEmpty)
+        #expect(store.load().workspaces.isEmpty)
     }
 
     @Test
@@ -238,6 +300,6 @@ struct WorkspaceSerializerTests {
         defer { try? FileManager.default.removeItem(at: tmp) }
         try Data("not valid json {".utf8).write(to: tmp)
         let store = WorkspaceStore(fileURL: tmp)
-        #expect(store.load().isEmpty)
+        #expect(store.load().workspaces.isEmpty)
     }
 }

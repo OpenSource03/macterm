@@ -12,6 +12,13 @@ struct TerminalPane: View {
     let onSplitRequest: (SplitDirection, SplitPosition) -> Void
     let onZoomRequest: () -> Void
 
+    @Environment(AppState.self)
+    private var appState
+    @State
+    private var paneSize: CGSize = .zero
+    @State
+    private var dropEdge: PaneDropEdge?
+
     var body: some View {
         // The search bar sits above the terminal surface in a VStack, so showing
         // it pushes the terminal content down rather than overlaying it.
@@ -42,6 +49,41 @@ struct TerminalPane: View {
                 onSplitRequest: onSplitRequest,
                 onZoomRequest: onZoomRequest
             )
+        }
+        // Accept a tab dragged from the sidebar: dropping on an edge links it
+        // into a side-by-side group with this pane. `onDrop` only engages during
+        // a drag, so normal terminal mouse input is unaffected.
+        .onGeometryChange(for: CGSize.self, of: \.size) { paneSize = $0 }
+        .onDrop(
+            of: [.mactermTab],
+            delegate: TabLinkDropDelegate(
+                appState: appState,
+                paneID: pane.id,
+                size: paneSize,
+                hoveredEdge: $dropEdge
+            )
+        )
+        .overlay { dropPlacementPreview }
+    }
+
+    /// Highlights the half of the pane a drop would occupy, following the
+    /// hovered edge like an editor's split preview.
+    @ViewBuilder
+    private var dropPlacementPreview: some View {
+        if let dropEdge {
+            GeometryReader { geo in
+                let rect = dropEdge.previewRect(in: geo.size)
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(MactermTheme.accentSoft)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .strokeBorder(MactermTheme.accent, lineWidth: 2)
+                    )
+                    .frame(width: rect.width, height: rect.height)
+                    .position(x: rect.midX, y: rect.midY)
+            }
+            .allowsHitTesting(false)
+            .animation(.easeOut(duration: 0.12), value: dropEdge)
         }
     }
 }

@@ -11,6 +11,19 @@ final class AppState {
     }
 
     var workspaces: [UUID: Workspace] = [:]
+    /// Linked tab groups, keyed by group id. A group shares one combined split
+    /// layout across its member tabs (which may span projects). See `TabGroup`
+    /// and `AppState+Groups`.
+    var groups: [UUID: TabGroup] = [:]
+    /// Monotonic source for `TabGroup.colorIndex` so each new group gets a
+    /// distinct sidebar accent. Restored to one past the max persisted index.
+    @ObservationIgnored
+    var groupColorCounter = 0
+    /// The tab currently being dragged from the sidebar onto a pane, set on drag
+    /// start and read synchronously when a pane accepts the drop. Not observed —
+    /// it only matters at the moment of a drop.
+    @ObservationIgnored
+    var draggingTab: TabTransfer?
     var sidebarVisible = true
     var pendingClosePane: PendingClosePane?
     /// A computed layout-apply plan awaiting user confirmation because applying
@@ -163,18 +176,23 @@ final class AppState {
     func restoreSelection(projects: [Project]) {
         logger.info("restoreSelection: \(projects.count, privacy: .public) projects")
         hasRestoredSelection = true
-        let snapshots = workspaceStore.load()
+        let loaded = workspaceStore.load()
         let valid = Set(projects.map(\.id))
         // A committed layout file is the source of truth: skip restoring the
         // session snapshot for any project that has one, leaving its workspace
         // nil so it rebuilds from `.macterm/layout.yaml` on open (below / on
         // first select). Projects with no layout file restore their snapshot.
         let pathByID = Dictionary(projects.map { ($0.id, $0.path) }, uniquingKeysWith: { a, _ in a })
-        for ws in WorkspaceSerializer.restore(from: snapshots, validIDs: valid)
+        for ws in WorkspaceSerializer.restore(from: loaded.workspaces, validIDs: valid)
             where !LayoutFile.exists(atProjectRoot: pathByID[ws.projectID] ?? "")
         {
             workspaces[ws.projectID] = ws
         }
+        // Rebuild linked groups after every workspace is in place, since a
+        // group's members can span projects.
+        let restored = WorkspaceSerializer.restoreGroups(loaded.groups, into: workspaces)
+        groups = restored.groups
+        groupColorCounter = restored.nextColorIndex
         if let id = Preferences.shared.activeProjectID,
            let project = projects.first(where: { $0.id == id })
         {
@@ -191,7 +209,8 @@ final class AppState {
     }
 
     func saveWorkspaces() {
-        workspaceStore.save(WorkspaceSerializer.snapshot(workspaces))
+        let snapshot = WorkspaceSerializer.snapshot(workspaces, groups: groups)
+        workspaceStore.save(workspaces: snapshot.workspaces, groups: snapshot.groups)
     }
 
     // MARK: - Project
@@ -303,7 +322,7 @@ final class AppState {
         for pane in ws.tabs.flatMap({ $0.splitRoot.allPanes() }) {
             pane.destroySurface()
         }
-        if let restored = WorkspaceSerializer.restore(from: snapshot, validIDs: [projectID]).first {
+        if let restored = WorkspaceSerializer.restore(from: snapshot.workspaces, validIDs: [projectID]).first {
             workspaces[projectID] = restored
         }
         if activeProjectID == projectID { activeProjectID = nil }
@@ -312,6 +331,10 @@ final class AppState {
 
     func removeProject(_ projectID: UUID) {
         logger.debug("removeProject: \(projectID, privacy: .public)")
+        // Dissolve any linked group that has a member in this project first, so
+        // members living in other projects detach back to their own standalone
+        // tabs (surfaces intact) instead of being torn down with this one.
+        dissolveGroupsTouching(projectID: projectID)
         if let ws = workspaces[projectID] {
             for pane in ws.tabs.flatMap({ $0.splitRoot.allPanes() }) {
                 pane.destroySurface()
@@ -344,6 +367,16 @@ final class AppState {
               let tab = ws.tabs.first(where: { $0.id == tabID })
         else { return }
         logger.debug("closeTab: \(tabID, privacy: .public) project=\(projectID, privacy: .public)")
+        // If the tab is in a linked group, detach it first so the combined tree
+        // (and the other members' live surfaces) survive. Closing the host
+        // dissolves the group, returning every member to its own standalone tab.
+        if let gid = tab.linkedGroupID, let group = groups[gid] {
+            if tabID == group.hostTabID {
+                dissolveGroup(group)
+            } else {
+                detachMember(tabID, from: group)
+            }
+        }
         for pane in tab.splitRoot.allPanes() {
             pane.destroySurface()
         }
@@ -467,7 +500,7 @@ final class AppState {
     // MARK: - Splits
 
     func splitPane(direction: SplitDirection, projectID: UUID) {
-        guard let tab = workspaces[projectID]?.activeTab,
+        guard let tab = renderedActiveTab(projectID: projectID),
               let paneID = tab.focusedPaneID
         else { return }
         logger.debug("splitPane: \(String(describing: direction), privacy: .public) pane=\(paneID, privacy: .public)")
@@ -486,32 +519,45 @@ final class AppState {
     }
 
     func resizePane(_ direction: PaneFocusDirection, projectID: UUID, delta: CGFloat = 0.03) {
-        workspaces[projectID]?.activeTab?.resize(direction, delta: delta)
+        renderedActiveTab(projectID: projectID)?.resize(direction, delta: delta)
         saveWorkspaces()
     }
 
     func equalizeSplits(projectID: UUID) {
-        workspaces[projectID]?.activeTab?.equalizeSplits()
+        renderedActiveTab(projectID: projectID)?.equalizeSplits()
         saveWorkspaces()
     }
 
     func toggleZoom(projectID: UUID) {
-        guard let tab = workspaces[projectID]?.activeTab,
+        guard let tab = renderedActiveTab(projectID: projectID),
               let paneID = tab.focusedPaneID
         else { return }
         tab.toggleZoom(paneID: paneID)
     }
 
     func closePane(_ paneID: UUID, projectID: UUID) {
-        guard let ws = workspaces[projectID] else { return }
-        // Find the tab that actually contains this pane (not just the active tab)
-        guard let tab = ws.tabs.first(where: { $0.splitRoot.findPane(id: paneID) != nil }) else {
+        // The pane lives in whichever tab owns its tree — for a linked group
+        // that's the host tab, which may sit in another project's workspace.
+        guard let (ws, tab) = findTabContainingPane(paneID) else { return }
+        if let gid = tab.linkedGroupID, let group = groups[gid] {
+            switch tab.removePane(paneID) {
+            case .onlyPaneLeft:
+                // The whole combined tree is down to one pane: collapse the
+                // group back to a single standalone tab owning that pane.
+                collapseGroupToLastPane(group)
+            case .removed:
+                // A member may have lost its last contributed pane — drop it.
+                reconcileMembership(group)
+                saveWorkspaces()
+            case .notFound:
+                break
+            }
             return
         }
         logger.debug("closePane: \(paneID, privacy: .public) project=\(projectID, privacy: .public)")
         switch tab.removePane(paneID) {
         case .onlyPaneLeft:
-            closeTab(tab.id, projectID: projectID)
+            closeTab(tab.id, projectID: ws.projectID)
         case .removed:
             saveWorkspaces()
         case .notFound:
@@ -667,51 +713,60 @@ final class AppState {
     }
 
     func focusPane(_ paneID: UUID, projectID: UUID) {
-        workspaces[projectID]?.activeTab?.focusPane(paneID)
+        // Focus is tracked on the tab that owns the pane's tree (the group host
+        // when linked), so the combined view stays in sync from any member.
+        if let (_, tab) = findTabContainingPane(paneID) {
+            tab.focusPane(paneID)
+        } else {
+            workspaces[projectID]?.activeTab?.focusPane(paneID)
+        }
     }
 
-    func navigateToPane(_ paneID: UUID, projectID: UUID) {
-        guard workspaces[projectID] != nil else {
+    func navigateToPane(_ paneID: UUID, projectID _: UUID) {
+        // The pane lives in its owning (host) tab, which may be in a different
+        // project than the one that originated the notification — resolve it
+        // globally so the jump lands on the right project/tab.
+        guard let (ws, tab) = findTabContainingPane(paneID) else {
             NSApp.activate()
             if let appDelegate = NSApp.delegate as? AppDelegate {
                 appDelegate.reopenIfNeeded()
             }
             return
         }
-        activeProjectID = projectID
-        recordProjectVisit(projectID)
-        if let tab = workspaces[projectID]?.tabs.first(where: { $0.splitRoot.findPane(id: paneID) != nil }) {
-            let beforeTabID = workspaces[projectID]?.activeTabID
-            let beforeFocusedPaneID = tab.focusedPaneID
-            let didAcknowledgeCompletion = workspaces[projectID]?.selectTab(tab.id) ?? false
-            tab.focusPane(paneID)
-            if workspaces[projectID]?.activeTabID != beforeTabID
-                || tab.focusedPaneID != beforeFocusedPaneID
-                || didAcknowledgeCompletion
-            {
-                saveWorkspaces()
-            }
+        activeProjectID = ws.projectID
+        recordProjectVisit(ws.projectID)
+        // Select the member tab the notification came from when it's still
+        // distinct from the host; otherwise select the host tab itself. Persist
+        // only when the selection/focus actually moved (or a completion badge
+        // was acknowledged), matching the rest of the focus paths.
+        let beforeTabID = ws.activeTabID
+        let beforeFocusedPaneID = tab.focusedPaneID
+        let didAcknowledgeCompletion = ws.selectTab(tab.id)
+        tab.focusPane(paneID)
+        if ws.activeTabID != beforeTabID
+            || tab.focusedPaneID != beforeFocusedPaneID
+            || didAcknowledgeCompletion
+        {
+            saveWorkspaces()
         }
         if let appDelegate = NSApp.delegate as? AppDelegate {
             appDelegate.reopenIfNeeded()
         }
         NSApp.activate()
-        if let tab = workspaces[projectID]?.tabs.first(where: { $0.splitRoot.findPane(id: paneID) != nil }) {
-            let window = NSApp.keyWindow ?? NSApp.mainWindow
-            DispatchQueue.main.async {
-                FocusRestoration.restoreFocus(to: paneID, in: tab.splitRoot, window: window)
-            }
+        let window = NSApp.keyWindow ?? NSApp.mainWindow
+        DispatchQueue.main.async {
+            FocusRestoration.restoreFocus(to: paneID, in: tab.splitRoot, window: window)
         }
     }
 
     func focusedPane(for projectID: UUID) -> Pane? {
-        workspaces[projectID]?.activeTab?.focusedPane
+        renderedActiveTab(projectID: projectID)?.focusedPane
     }
 
     // MARK: - Pane focus navigation
 
     func focusPaneInDirection(_ direction: PaneFocusDirection, projectID: UUID) {
-        guard let tab = workspaces[projectID]?.activeTab,
+        guard let tab = renderedActiveTab(projectID: projectID),
               let focusedID = tab.focusedPaneID
         else { return }
         if let bestID = tab.splitRoot.nearestPane(from: focusedID, direction: direction) {
@@ -753,7 +808,7 @@ final class AppState {
 
     func restoreFocusToActivePane() {
         guard let projectID = activeProjectID,
-              let tab = workspaces[projectID]?.activeTab,
+              let tab = renderedActiveTab(projectID: projectID),
               let paneID = tab.focusedPaneID
         else { return }
         FocusRestoration.restoreFocus(

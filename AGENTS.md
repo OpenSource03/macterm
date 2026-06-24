@@ -53,6 +53,12 @@ MactermApp (SwiftUI @main)
 - **`TerminalTab`** — owns a `SplitNode` tree and focused pane ID.
 - **`SplitNode`** — recursive enum: `.pane(Pane)` or `.split(SplitBranch)`.
 
+### Linked Tab Groups
+
+Tabs can be **linked** into a group that shares one combined split layout, even across projects. Drag a tab from the sidebar onto a pane's edge (directional drop zones), or multi-select tabs in the sidebar and choose **Link in Split**. Every member keeps its sidebar row, marked with a shared accent stripe + link badge; selecting any member renders the same combined view.
+
+The combined tree physically lives in the group's **host tab** (`TabGroup.hostTabID`); other members' subtrees are spliced into it and each pane is tagged with `Pane.originTabID`. Because membership is derived from those tags (not branch ids), unlink/detach and persistence are restore-stable. This leans on the same pane-owns-its-NSView invariant as everything else — splicing a member's subtree into the host moves the live surfaces without tearing them down. `AppState+Groups.swift` owns the lifecycle (`linkTab`, `linkTabs`, `unlinkTab`, `dissolveGroup`, reconciliation on pane close); `renderedTab(for:)` resolves a member to its host for rendering and every pane operation. Cross-project panes keep their own `projectID`, persisted per-pane. `SplitNode` gains splice/extract helpers (see `SplitNodeSpliceTests`), and `TabDragAndDrop.swift` provides the `TabTransfer` payload + directional `PaneDropDelegate` drop zones.
+
 ### Single Window Enforcement
 
 The app blocks additional windows. `WindowGroup`'s `.newItem` command is replaced with a "Show Window" item (Cmd+N) that re-fronts the existing window. The close button hides (`orderOut`) instead of closing, preserving surfaces. Dock-icon reopen goes through an `NSWorkspace.didActivateApplicationNotification` observer in `AppDelegate.reopenIfNeeded()` — `applicationShouldHandleReopen` alone isn't reliable through `@NSApplicationDelegateAdaptor`, and AppKit reports `canBecomeMain = false` on ordered-out windows, so the filter walks `NSApp.windows` for any hidden non-panel window.

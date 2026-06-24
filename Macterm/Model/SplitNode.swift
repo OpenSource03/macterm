@@ -407,6 +407,12 @@ final class Pane: Identifiable {
         programTitlePID = programPID
     }
 
+    /// When this pane lives inside a *linked group's* combined tree (which is
+    /// physically hosted by one tab), this records which member tab the pane
+    /// was contributed by. `nil` means the pane belongs to the host tab's own
+    /// content. Used to extract a member's panes again when it unlinks.
+    var originTabID: UUID?
+
     /// The live terminal NSView for this pane. Created lazily the first time
     /// it's requested, destroyed explicitly when the pane is removed from the
     /// tree. Owning the view on the model (instead of in a separate cache or
@@ -721,6 +727,110 @@ extension SplitNode {
 }
 
 enum PaneFocusDirection { case left, right, up, down }
+
+/// Which edge of a target pane a dropped subtree lands on.
+enum PaneDropEdge { case left, right, top, bottom }
+
+// MARK: - Splice / node lookup (linked-group tree surgery)
+
+@MainActor
+extension SplitNode {
+    /// Insert an existing `subtree` next to the pane `paneID` on the given
+    /// `edge`, wrapping them in a new branch. Returns the rewritten tree and the
+    /// id of the new "seam" branch (so an unlink can later detach the subtree by
+    /// replacing that branch with its non-subtree child). Returns `nil` seam if
+    /// the pane wasn't found.
+    func splicing(
+        subtree: SplitNode,
+        atPaneID paneID: UUID,
+        edge: PaneDropEdge
+    ) -> (node: SplitNode, seamID: UUID?) {
+        switch self {
+        case let .pane(p) where p.id == paneID:
+            let direction: SplitDirection = (edge == .left || edge == .right) ? .horizontal : .vertical
+            let paneFirst = (edge == .right || edge == .bottom)
+            let first: SplitNode = paneFirst ? .pane(p) : subtree
+            let second: SplitNode = paneFirst ? subtree : .pane(p)
+            let branch = SplitBranch(direction: direction, first: first, second: second)
+            return (.split(branch), branch.id)
+        case .pane:
+            return (self, nil)
+        case let .split(branch):
+            let (newFirst, s1) = branch.first.splicing(subtree: subtree, atPaneID: paneID, edge: edge)
+            branch.first = newFirst
+            if let s1 { return (.split(branch), s1) }
+            let (newSecond, s2) = branch.second.splicing(subtree: subtree, atPaneID: paneID, edge: edge)
+            branch.second = newSecond
+            return (.split(branch), s2)
+        }
+    }
+
+    /// Find any node (pane or branch) by its id.
+    func node(withID id: UUID) -> SplitNode? {
+        if self.id == id { return self }
+        if case let .split(b) = self {
+            return b.first.node(withID: id) ?? b.second.node(withID: id)
+        }
+        return nil
+    }
+
+    /// Replace the subtree whose node id == `id` with `replacement`. No-op if
+    /// the id isn't present.
+    func replacingNode(id: UUID, with replacement: SplitNode) -> SplitNode {
+        if self.id == id { return replacement }
+        if case let .split(b) = self {
+            b.first = b.first.replacingNode(id: id, with: replacement)
+            b.second = b.second.replacingNode(id: id, with: replacement)
+            return .split(b)
+        }
+        return self
+    }
+
+    /// Tag every pane in this subtree with an originating tab id (or clear it).
+    func assignOriginTab(_ tabID: UUID?) {
+        for pane in allPanes() {
+            pane.originTabID = tabID
+        }
+    }
+
+    /// True when this subtree is non-empty and every pane originates from `tabID`.
+    func isOwned(by tabID: UUID) -> Bool {
+        let panes = allPanes()
+        return !panes.isEmpty && panes.allSatisfy { $0.originTabID == tabID }
+    }
+
+    /// The highest subtree all of whose panes originate from `tabID` — i.e. the
+    /// member's contributed region of a linked group's combined tree. Used to
+    /// detach a member cleanly without storing branch ids (restore-stable, since
+    /// it's derived from `Pane.originTabID` alone).
+    func topmostSubtree(ownedBy tabID: UUID) -> SplitNode? {
+        if isOwned(by: tabID) { return self }
+        if case let .split(b) = self {
+            return b.first.topmostSubtree(ownedBy: tabID) ?? b.second.topmostSubtree(ownedBy: tabID)
+        }
+        return nil
+    }
+
+    /// Remove the node (pane or branch) with the given id, promoting its sibling
+    /// into its place. Returns `nil` if the whole tree was that node.
+    func removingNode(id: UUID) -> SplitNode? {
+        switch self {
+        case let .pane(p): return p.id == id ? nil : self
+        case let .split(branch):
+            if branch.first.id == id { return branch.second }
+            if branch.second.id == id { return branch.first }
+            if branch.first.node(withID: id) != nil {
+                if let nf = branch.first.removingNode(id: id) { branch.first = nf }
+                return .split(branch)
+            }
+            if branch.second.node(withID: id) != nil {
+                if let ns = branch.second.removingNode(id: id) { branch.second = ns }
+                return .split(branch)
+            }
+            return self
+        }
+    }
+}
 
 @MainActor
 extension SplitNode {

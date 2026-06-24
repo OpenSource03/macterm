@@ -7,6 +7,12 @@ final class TerminalTab: Identifiable {
     var customTitle: String?
     var splitRoot: SplitNode
     var focusedPaneID: UUID?
+    /// Non-nil when this tab belongs to a linked group. The group shares one
+    /// combined split layout across its members; see `TabGroup`. The combined
+    /// tree lives in the group's host tab, so a non-host member's own
+    /// `splitRoot` is dormant while linked — selecting it renders the host's
+    /// tree instead. Transient relationship, rebuilt from persistence on launch.
+    var linkedGroupID: UUID?
     /// When set, the split tree renders only this pane (zoom). The tree
     /// itself is untouched — clearing this restores the full layout.
     /// Transient: not persisted across launches.
@@ -115,6 +121,11 @@ final class TerminalTab: Identifiable {
             paneID: paneID, direction: direction, position: .second, projectPath: sourcePath, projectID: sourceProjectID
         )
         splitRoot = newRoot
+        // Inherit the source pane's group origin so a member's region of a
+        // linked group's combined tree stays cleanly tagged when split.
+        if let newID, let newPane = splitRoot.findPane(id: newID) {
+            newPane.originTabID = pane?.originTabID
+        }
         // Splitting reveals a new pane — exit zoom so it's visible.
         zoomedPaneID = nil
         if let newID { focusPane(newID) }

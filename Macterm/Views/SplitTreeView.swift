@@ -59,9 +59,6 @@ struct SplitTreeView: View {
                 onZoomRequest: { onToggleZoom(pane.id) },
                 onMovePane: onMovePane
             )
-            .overlay {
-                PaneFocusOverlay(isFocused: isFocused, isSplit: isSplit)
-            }
 
         case let .split(branch):
             SplitDividerView(branch: branch) {
@@ -136,6 +133,9 @@ private struct SplitLeafView: View {
                 onSplitRequest: { dir, _ in onSplitRequest(dir) },
                 onZoomRequest: onZoomRequest
             )
+            .overlay {
+                PaneFocusOverlay(isFocused: isFocused, isSplit: isSplit)
+            }
             .background {
                 if !isSelfDragging {
                     Color.clear

@@ -35,6 +35,19 @@ enum MactermTheme {
     @MainActor
     static var terminalBg: Color { bg }
 
+    /// Distinct accents for linked tab groups, pulled from the terminal's ANSI
+    /// palette so they track the user's theme rather than hardcoding hues.
+    /// Cycles through easily-distinguished slots; `index` is a group's stable
+    /// `colorIndex`.
+    @MainActor
+    static func groupAccent(_ index: Int) -> Color {
+        // blue, green, magenta, yellow, cyan, red
+        let slots = [4, 2, 5, 3, 6, 1]
+        let slot = slots[((index % slots.count) + slots.count) % slots.count]
+        if let color = GhosttyApp.shared.paletteColor(at: slot) { return Color(nsColor: color) }
+        return accent
+    }
+
     @MainActor
     static var colorScheme: ColorScheme {
         let bg = GhosttyApp.shared.backgroundColor

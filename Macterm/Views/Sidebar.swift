@@ -3,6 +3,11 @@ import SwiftUI
 private enum SidebarItem: Hashable {
     case project(UUID)
     case tab(projectID: UUID, tabID: UUID)
+
+    var tabID: UUID? {
+        if case let .tab(_, tabID) = self { return tabID }
+        return nil
+    }
 }
 
 struct SidebarContent: View {
@@ -15,7 +20,7 @@ struct SidebarContent: View {
     @State
     private var expandedProjects: Set<UUID> = []
     @State
-    private var selection: SidebarItem?
+    private var selection: Set<SidebarItem> = []
 
     var body: some View {
         List(selection: $selection) {
@@ -33,6 +38,8 @@ struct SidebarContent: View {
                             index: tabIndex + 1,
                             isActive: ws?.activeTabID == tab.id && appState.activeProjectID == project.id,
                             moveTargets: projectStore.projects.filter { $0.id != project.id },
+                            group: appState.group(for: tab),
+                            canLinkSelection: selectedTabIDs.count >= 2 && selectedTabIDs.contains(tab.id),
                             onClose: { appState.closeTab(tab.id, projectID: project.id) },
                             onRename: { newName in
                                 tab.customTitle = newName.isEmpty ? nil : newName
@@ -41,9 +48,19 @@ struct SidebarContent: View {
                             onMoveToProject: { destination in
                                 appState.moveTab(tab.id, from: project.id, to: destination.id, destPath: destination.path)
                                 expandedProjects.insert(destination.id)
+                            },
+                            onLinkSelection: {
+                                appState.linkTabs(selectedTabIDs)
+                            },
+                            onUnlink: {
+                                appState.unlinkTab(tab.id)
                             }
                         )
                         .tag(SidebarItem.tab(projectID: project.id, tabID: tab.id))
+                        .onDrag {
+                            appState.draggingTab = TabTransfer(projectID: project.id, tabID: tab.id)
+                            return TabTransfer(projectID: project.id, tabID: tab.id).itemProvider()
+                        }
                     }
                     .onMove { source, destination in
                         appState.workspaces[project.id]?.reorderTabs(fromOffsets: source, toOffset: destination)
@@ -95,8 +112,11 @@ struct SidebarContent: View {
                 }
             }
         }
-        .onChange(of: selection) { _, item in
-            guard let item else { return }
+        // Only a single selection activates a project/tab; a multi-selection is
+        // a transient gesture for the context menu (e.g. "Link in Split") and
+        // leaves the active tab untouched.
+        .onChange(of: selection) { _, items in
+            guard items.count == 1, let item = items.first else { return }
             switch item {
             case let .project(projectID):
                 guard let project = projectStore.projects.first(where: { $0.id == projectID }) else { return }
@@ -126,16 +146,32 @@ struct SidebarContent: View {
         return appState.workspaces[pid]?.activeTabID
     }
 
+    /// Selected tab ids in sidebar (project, then tab) order — the order in
+    /// which `linkTabs` should host/tile them.
+    private var selectedTabIDs: [UUID] {
+        let selected = Set(selection.compactMap(\.tabID))
+        guard !selected.isEmpty else { return [] }
+        var ordered: [UUID] = []
+        for project in projectStore.projects {
+            for tab in appState.workspaces[project.id]?.tabs ?? [] where selected.contains(tab.id) {
+                ordered.append(tab.id)
+            }
+        }
+        return ordered
+    }
+
     private func syncSelection() {
         guard let pid = appState.activeProjectID,
               let ws = appState.workspaces[pid],
               let tabID = ws.activeTabID
         else {
-            selection = appState.activeProjectID.map { .project($0) }
+            selection = appState.activeProjectID.map { [.project($0)] } ?? []
             return
         }
         let desired = SidebarItem.tab(projectID: pid, tabID: tabID)
-        if selection != desired { selection = desired }
+        // Don't collapse a deliberate multi-selection just because the active
+        // tab is already part of it.
+        if !selection.contains(desired) { selection = [desired] }
     }
 
     private func openProject() {
@@ -233,9 +269,13 @@ private struct SidebarTabRow: View {
     let index: Int
     let isActive: Bool
     let moveTargets: [Project]
+    let group: TabGroup?
+    let canLinkSelection: Bool
     let onClose: () -> Void
     let onRename: (String) -> Void
     let onMoveToProject: (Project) -> Void
+    let onLinkSelection: () -> Void
+    let onUnlink: () -> Void
     @Environment(AppState.self)
     private var appState
     @AppStorage(Preferences.Keys.tabIconSymbol)
@@ -250,6 +290,11 @@ private struct SidebarTabRow: View {
     private var preEditCustomTitle: String?
     @FocusState
     private var focused: Bool
+
+    /// The group's stable accent, used for the stripe and link badge.
+    private var groupColor: Color? {
+        group.map { MactermTheme.groupAccent($0.colorIndex) }
+    }
 
     @ViewBuilder
     private var titleContent: some View {
@@ -267,27 +312,47 @@ private struct SidebarTabRow: View {
     }
 
     var body: some View {
-        Group {
-            if tabIconSymbol == Preferences.noIcon {
-                Label {
-                    titleContent
-                } icon: {
-                    if showTabStatusIndicator {
-                        TabStatusGlyph(state: displayState, symbol: tabIconSymbol, index: index)
+        HStack(spacing: 6) {
+            Group {
+                if tabIconSymbol == Preferences.noIcon {
+                    Label {
+                        titleContent
+                    } icon: {
+                        if showTabStatusIndicator {
+                            TabStatusGlyph(state: displayState, symbol: tabIconSymbol, index: index)
+                        }
+                    }
+                    .labelStyle(.titleAndIcon)
+                } else {
+                    Label {
+                        titleContent
+                    } icon: {
+                        if showTabStatusIndicator {
+                            TabStatusGlyph(state: displayState, symbol: tabIconSymbol, index: index)
+                        } else {
+                            SidebarRowIcon(symbol: tabIconSymbol, index: index)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                 }
-                .labelStyle(.titleAndIcon)
-            } else {
-                Label {
-                    titleContent
-                } icon: {
-                    if showTabStatusIndicator {
-                        TabStatusGlyph(state: displayState, symbol: tabIconSymbol, index: index)
-                    } else {
-                        SidebarRowIcon(symbol: tabIconSymbol, index: index)
-                            .foregroundStyle(.secondary)
-                    }
-                }
+            }
+            // A link badge in the group's accent marks tabs sharing a combined
+            // split, mirroring the leading stripe.
+            if let groupColor {
+                Spacer(minLength: 0)
+                Image(systemName: "link")
+                    .font(.caption2)
+                    .foregroundStyle(groupColor)
+                    .help("Part of a linked split group")
+            }
+        }
+        .overlay(alignment: .leading) {
+            if let groupColor {
+                Capsule()
+                    .fill(groupColor)
+                    .frame(width: 2.5)
+                    .padding(.vertical, 2)
+                    .offset(x: -8)
             }
         }
         .contextMenu {
@@ -298,6 +363,14 @@ private struct SidebarTabRow: View {
                         Button(project.name) { onMoveToProject(project) }
                     }
                 }
+            }
+            if canLinkSelection {
+                Divider()
+                Button("Link in Split", systemImage: "rectangle.split.2x1", action: onLinkSelection)
+            }
+            if group != nil {
+                if !canLinkSelection { Divider() }
+                Button("Unlink from Group", systemImage: "link.badge.plus", action: onUnlink)
             }
             Divider()
             Button("Close Tab", action: onClose)

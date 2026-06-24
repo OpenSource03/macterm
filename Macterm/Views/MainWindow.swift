@@ -42,6 +42,14 @@ struct MainWindow: View {
                 detailWidth = width
             }
             .toolbar {
+                // Sits next to the sidebar collapse control at the top-leading.
+                ToolbarItem(placement: .navigation) {
+                    Button(action: newTerminal) {
+                        Image(systemName: "plus")
+                    }
+                    .help("New Terminal")
+                    .disabled(activeProject == nil)
+                }
                 ToolbarItem(placement: .primaryAction) {
                     UpdateAvailableToolbarButton()
                 }
@@ -95,6 +103,14 @@ struct MainWindow: View {
     private var activeTabTitle: String {
         guard let project = activeProject else { return "" }
         return project.path
+    }
+
+    /// Open a new terminal tab in the active project, mirroring the Cmd+T
+    /// hotkey and the sidebar project row's "New Tab" action.
+    private func newTerminal() {
+        guard let project = activeProject else { return }
+        appState.selectProject(project)
+        appState.createTab(projectID: project.id, projects: projectStore.projects)
     }
 }
 
@@ -196,7 +212,9 @@ struct WorkspaceView: View {
     private var appState
 
     var body: some View {
-        if let ws = appState.workspaces[project.id], let tab = ws.activeTab {
+        // For a linked group the active tab may be a member whose combined tree
+        // lives in the host tab (possibly in another project) — render that host.
+        if let tab = appState.renderedActiveTab(projectID: project.id) {
             let renderedNode: SplitNode = {
                 if let zoomID = tab.zoomedPaneID, let pane = tab.splitRoot.findPane(id: zoomID) {
                     return .pane(pane)
