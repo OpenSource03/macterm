@@ -66,11 +66,6 @@ final class MactermConfig {
             "background-blur = 0",
         ]
 
-        overrides.append(contentsOf: TerminalBackgroundOverride.configLines(
-            source: Preferences.shared.terminalBackgroundSource,
-            color: Preferences.shared.terminalBackgroundOverrideColor
-        ))
-
         // libghostty auto-populates `GHOSTTY_BIN_DIR` in spawned shells from
         // the host executable's directory — for us that's Macterm's bundle,
         // which ships no `ghostty` CLI. The shell-integration `ssh` wrapper
