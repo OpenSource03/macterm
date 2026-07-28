@@ -161,21 +161,6 @@ final class AppState {
         (NSApp?.windows ?? []).contains { $0.isVisible && $0.occlusionState.contains(.visible) }
     }
 
-    /// Whether a pane's surface is occluded — its renderer parked by
-    /// `ghostty_surface_set_occlusion`, so render/scrollbar heartbeats are
-    /// suppressed and silence says nothing about completion. Injectable for
-    /// tests. "No window" counts as occluded, which also covers panes
-    /// incubated off-screen (the incubator window is never visible).
-    @ObservationIgnored
-    var paneIsOccluded: (Pane) -> Bool = { pane in
-        !(pane.nsView?.window?.occlusionState.contains(.visible) ?? false)
-    }
-
-    /// Panes that were occluded on the previous poll tick, so the visible
-    /// transition can restart their quiet window before settling resumes.
-    @ObservationIgnored
-    private var previouslyOccludedPanes: Set<UUID> = []
-
     /// zmx session-persistence client. Injectable so tests can observe
     /// session kills without a real daemon.
     @ObservationIgnored
@@ -236,8 +221,20 @@ final class AppState {
         let onEvent: @Sendable (Notification) -> Void = { [weak self] _ in
             MainActor.assumeIsolated { self?.notePollEvent() }
         }
+        let onQuietSettleDeadline: @Sendable (Notification) -> Void = { [weak self] _ in
+            // Do not route through notePollEvent: if another poll ran within
+            // 250ms, coalescing plus a fully occluded window would pause with
+            // no timer and never retry this deadline.
+            MainActor.assumeIsolated { self?.pollNow() }
+        }
         let tokens: [(NotificationCenter, NSObjectProtocol)] = [
             (center, center.addObserver(forName: .terminalPollEvent, object: nil, queue: .main, using: onEvent)),
+            (center, center.addObserver(
+                forName: .terminalQuietSettleDeadline,
+                object: nil,
+                queue: .main,
+                using: onQuietSettleDeadline
+            )),
             (center, center.addObserver(
                 forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main, using: onEvent
             )),
@@ -375,13 +372,11 @@ final class AppState {
         // this feature.
         let trackExecution = Preferences.shared.showTabStatusIndicator
         var didAcknowledgeCompletion = false
-        var seenPanes: Set<UUID> = []
         var sawBusyPane = false
         var activeRemotePanes: [Pane] = []
         for (projectID, ws) in workspaces {
             for tab in ws.tabs {
                 for pane in tab.splitRoot.allPanes() {
-                    seenPanes.insert(pane.id)
                     if pane.isRemote {
                         // The local process table only knows `ssh` here — a
                         // local refresh would stomp the probe-derived name
@@ -395,8 +390,12 @@ final class AppState {
                     } else {
                         pane.refreshForegroundProcess(trackExecution: trackExecution)
                     }
+                    // An activity-sourced run whose output has been quiet past
+                    // the window settles to `.done`. The output heartbeat is
+                    // occlusion-independent, so silence is meaningful whether or
+                    // not the pane is on screen — no occlusion special-casing.
                     if trackExecution {
-                        settleIfVisible(pane)
+                        pane.settleTerminalActivityIfQuiet()
                     }
                     if pane.executionState == .running { sawBusyPane = true }
                     didAcknowledgeCompletion = acknowledgeFinishedCommandIfActive(
@@ -407,32 +406,11 @@ final class AppState {
                 }
             }
         }
-        previouslyOccludedPanes.formIntersection(seenPanes)
         lastPollSawBusyPane = sawBusyPane
         if didAcknowledgeCompletion { saveWorkspaces() }
         if !activeRemotePanes.isEmpty, isAnyWindowVisible() {
             remoteForegroundResolver.refresh(panes: activeRemotePanes, probe: zmx.remoteForegroundComms)
         }
-    }
-
-    /// Quiet-settle only while the surface actually renders: an occluded pane
-    /// emits no activity heartbeats (its renderer is parked), so settling it
-    /// would misread suppressed output as completion. On the occluded→visible
-    /// edge the quiet window restarts, giving a still-running program time to
-    /// deliver heartbeats again before the settle can fire.
-    ///
-    /// Not private so tests can drive the guard directly (`paneIsOccluded` is
-    /// injectable) without a live surface or mutating the `Preferences`
-    /// singleton the poll reads.
-    func settleIfVisible(_ pane: Pane) {
-        if paneIsOccluded(pane) {
-            previouslyOccludedPanes.insert(pane.id)
-            return
-        }
-        if previouslyOccludedPanes.remove(pane.id) != nil {
-            pane.refreshTerminalActivityWindow()
-        }
-        pane.settleTerminalActivityIfQuiet()
     }
 
     private func recordProjectVisit(_ projectID: UUID) {
@@ -1531,12 +1509,10 @@ final class AppState {
         projectID: UUID,
         saveImmediately: Bool = true
     ) -> Bool {
-        // The sidebar shows the *entire* active tab as idle (displayState masks
-        // `.done` for the tab the user is looking at), so every pane in that tab
-        // must actually be cleared — not just the focused one. Otherwise a
-        // non-focused split pane that finished a command stays `.done` under the
-        // hood, gets persisted, and reappears as a checkmark after restart even
-        // though the user saw an empty circle.
+        // Looking at the active tab acknowledges completion for the whole tab,
+        // not only its focused pane. Otherwise a non-focused split pane that
+        // finished a command stays `.done` under the hood, gets persisted, and
+        // reappears as a status dot after the user switches away or restarts.
         // Route through the injected `isAppActive` seam (not `NSApp.isActive`
         // directly): NSApp is nil during construction and unset in tests, and
         // this path is reachable from init via pollNow().

@@ -70,7 +70,35 @@ private enum TerminalExecutionSource: Equatable {
     case progress
 }
 
+/// Single source of truth for the two activity timings that must agree: how
+/// long an activity-owned run may stay silent before it settles, and when the
+/// dedicated wake that performs that settle fires. They are derived from one
+/// constant so an edit can't drift them apart.
+enum TerminalActivityTiming {
+    /// Silence after which an activity-owned run settles to `.done`.
+    static let quietInterval: TimeInterval = 3
+
+    /// Slack added to `quietInterval` for the scheduled wake. The settle
+    /// requires `now - lastActivityAt >= quietInterval`, so a wake targeting
+    /// exactly the threshold only works while timer jitter runs positive — and
+    /// the failure is bad: with every window occluded the ordinary poll is
+    /// stopped, so a marginally early wake would no-op the settle with no timer
+    /// left to retry, stranding the run at `.running` indefinitely. The margin
+    /// makes the wake land strictly after the threshold instead.
+    static let quietPollMargin: TimeInterval = 0.25
+
+    /// Delay for the dedicated quiet-settle wake.
+    static let quietPollDelay: TimeInterval = quietInterval + quietPollMargin
+}
+
 struct TerminalExecutionTracker {
+    private enum PendingOutputStart {
+        case armed(Date)
+        case candidate(Date)
+    }
+
+    private static let submissionWindow: TimeInterval = 2
+
     init(hasUserInteraction: Bool = false) {
         self.hasUserInteraction = hasUserInteraction
     }
@@ -80,39 +108,89 @@ struct TerminalExecutionTracker {
     /// every poll — so a settled process doesn't flip-flop back to running just
     /// because it is still foreground.
     private var lastForeground: ForegroundProcessKey?
+    /// Last observed tty input mode for `lastForeground`. Mode transitions are
+    /// meaningful even when the pid/name key is unchanged.
+    private var lastTerminalInputWasRaw: Bool?
     /// Why the pane is currently considered running. Foreground and explicit
-    /// progress run until a completion/foreground transition; activity is a
-    /// render/output heartbeat and quiet-settles.
+    /// progress run until a completion/foreground transition; activity is an
+    /// output heartbeat and quiet-settles.
     private var runningSource: TerminalExecutionSource?
     /// After progress clears, the foreground process that owned it is
     /// "quiesced": its own output and re-polls are ignored until the foreground
-    /// moves away, so a settled program that reported progress doesn't flip back
-    /// to running on its own render output. `pendingProgressQuiesce` covers the
-    /// race where progress started and cleared before any foreground poll.
+    /// moves away. `pendingProgressQuiesce` covers progress that starts and
+    /// clears before any foreground poll.
     private var progressQuiesced: ForegroundProcessKey?
     private var pendingProgressQuiesce = false
-    /// Output is ignored until the user has interacted with the pane, so a
-    /// freshly-restored shell's startup prompt doesn't show as activity.
+    /// Startup output is ignored until the pane has received user input (or a
+    /// declarative `run:`, which seeds this at initialization).
     private var hasUserInteraction = false
+    /// Geometry baseline carried by the IO-path output heartbeat. Growth is
+    /// strong activity evidence; equal totals describe an in-place redraw.
+    private var lastOutputRows: UInt64?
+    /// A narrowly-armed path for work nested inside a recognized AI agent. The
+    /// first in-place output heartbeat is only a candidate; a second within the
+    /// submission window confirms sustained work.
+    private var pendingOutputStart: PendingOutputStart?
+    /// A forwarded Return with no committed prompt text can still make a TUI
+    /// redraw or grow rows. Suppress those start signals briefly so an empty
+    /// submission cannot flash the spinner.
+    private var blankSubmissionAt: Date?
 
+    var isActivitySourced: Bool {
+        if case .activity = runningSource { return true }
+        return false
+    }
+
+    /// ORDERING CONTRACT: this CLEARS the in-place start arming, so a caller
+    /// that reports both an interaction and a submission for the same event
+    /// must call this FIRST — `recordCommandSubmission` arms, and an
+    /// interaction recorded after it would silently disarm the Pi path. The
+    /// `keyDown` / `sendText` / `sendKey` paths all fire `onInteraction` before
+    /// `onCommandSubmitted` for exactly this reason.
     mutating func recordUserInteraction() {
         hasUserInteraction = true
+        // Typing, scrolling, or any other interaction after Return means later
+        // redraws can no longer be attributed to that submission.
+        pendingOutputStart = nil
+    }
+
+    mutating func recordCommandSubmission(
+        at date: Date,
+        allowInPlaceOutputStart: Bool,
+        hasContent: Bool
+    ) {
+        hasUserInteraction = true
+        guard hasContent else {
+            pendingOutputStart = nil
+            blankSubmissionAt = date
+            return
+        }
+        // A deliberate nonempty submission supersedes a process quiesced by an
+        // earlier progress report, even when a long-lived TUI retains its pid.
+        progressQuiesced = nil
+        pendingProgressQuiesce = false
+        blankSubmissionAt = nil
+        pendingOutputStart = allowInPlaceOutputStart ? .armed(date) : nil
     }
 
     mutating func markProgressStarted(currentState: TerminalExecutionState) -> TerminalExecutionState {
+        pendingOutputStart = nil
+        blankSubmissionAt = nil
         guard hasUserInteraction else { return currentState }
         runningSource = .progress
         return .running
     }
 
     mutating func markCommandFinished(currentState: TerminalExecutionState) -> TerminalExecutionState {
-        // Shell integration (OSC 133;D) fires on *every* precmd, including
-        // empty commands — pressing Enter, Ctrl-C, or Ctrl-L on an idle prompt
-        // emits COMMAND_FINISHED with no preceding command. Only treat it as a
-        // real completion when a command was actually running; from idle it's
-        // precmd noise and must not flip the pane to `.done` (which would
-        // persist as a spurious checkmark after restart).
+        // Shell integration (OSC 133;D) fires on every precmd, including an
+        // empty Return. Always cancel its submission candidate, but only show a
+        // completion when a command was genuinely running.
+        pendingOutputStart = nil
+        // OSC 133;D for an empty Return may arrive before its redraw/output.
+        // Keep blank suppression while idle so that later callback cannot flash
+        // the spinner; a genuine running completion no longer needs it.
         guard currentState == .running else { return currentState }
+        blankSubmissionAt = nil
         runningSource = nil
         progressQuiesced = nil
         pendingProgressQuiesce = false
@@ -120,6 +198,8 @@ struct TerminalExecutionTracker {
     }
 
     mutating func markProgressFinished(currentState: TerminalExecutionState) -> TerminalExecutionState {
+        pendingOutputStart = nil
+        blankSubmissionAt = nil
         guard hasUserInteraction || runningSource == .progress else { return currentState }
         if let lastForeground {
             progressQuiesced = lastForeground
@@ -134,23 +214,85 @@ struct TerminalExecutionTracker {
         at date: Date,
         currentState: TerminalExecutionState
     ) -> TerminalExecutionState {
-        // A render/output heartbeat can keep an already-running command active,
-        // but it must never (re)start one. From `.done` — a finished command
-        // whose checkmark is showing — output (e.g. a background job) must not
-        // flip the pane back to running; only a new foreground process or an
-        // explicit progress marker can. Pinned by TerminalExecutionTrackerTests
-        // so a refactor of the onTerminalRender closure can't silently
-        // reintroduce the "prompt redraw keeps spinning" bug.
+        // Output may start an idle, interacted-with pane or sustain an
+        // activity-owned run. It must not resurrect `.done`, override explicit
+        // progress, or demote a canonical foreground command into a run that
+        // quiet-settles while its process is still alive.
         guard currentState != .done else { return currentState }
+        guard !shouldSuppressOutputStart(at: date, currentState: currentState) else { return currentState }
         guard runningSource != .progress else { return currentState }
+        guard runningSource != .foreground else { return currentState }
         if let progressQuiesced, progressQuiesced == lastForeground { return currentState }
-        // Output/render only counts after user interaction (or a declarative
-        // `run:`, which seeds `hasUserInteraction`). Fresh/restored shells can
-        // emit startup banners or shell-integration redraws before the user does
-        // anything; those must not become persisted completion indicators.
         guard hasUserInteraction else { return currentState }
+        pendingOutputStart = nil
         runningSource = .activity(date)
         return .running
+    }
+
+    /// Handle an occlusion-independent, throttled heartbeat from libghostty's
+    /// pty IO path. Scrollback growth is strong evidence and follows the normal
+    /// activity guards. Equal row totals only sustain an activity-owned run,
+    /// except for two heartbeats immediately following an explicitly armed
+    /// agent submission (the same-raw-pid Pi `! sleep` case).
+    mutating func markOutputActivity(
+        totalRows: UInt64,
+        at date: Date,
+        currentState: TerminalExecutionState
+    ) -> TerminalExecutionState {
+        let grew = lastOutputRows.map { totalRows > $0 } ?? false
+        lastOutputRows = totalRows
+        if grew {
+            return markTerminalActivity(at: date, currentState: currentState)
+        }
+
+        if currentState == .running, case .activity = runningSource {
+            pendingOutputStart = nil
+            runningSource = .activity(date)
+            return currentState
+        }
+
+        guard currentState == .idle else {
+            pendingOutputStart = nil
+            return currentState
+        }
+        guard hasUserInteraction else { return currentState }
+        guard runningSource != .progress else { return currentState }
+        if let progressQuiesced, progressQuiesced == lastForeground { return currentState }
+
+        switch pendingOutputStart {
+        case let .armed(submittedAt):
+            guard isWithinSubmissionWindow(date, submittedAt: submittedAt) else {
+                pendingOutputStart = nil
+                return currentState
+            }
+            pendingOutputStart = .candidate(submittedAt)
+            return currentState
+        case let .candidate(submittedAt):
+            guard isWithinSubmissionWindow(date, submittedAt: submittedAt) else {
+                pendingOutputStart = nil
+                return currentState
+            }
+            pendingOutputStart = nil
+            runningSource = .activity(date)
+            return .running
+        case nil:
+            return currentState
+        }
+    }
+
+    private func isWithinSubmissionWindow(_ date: Date, submittedAt: Date) -> Bool {
+        let elapsed = date.timeIntervalSince(submittedAt)
+        return elapsed >= 0 && elapsed < Self.submissionWindow
+    }
+
+    private mutating func shouldSuppressOutputStart(
+        at date: Date,
+        currentState: TerminalExecutionState
+    ) -> Bool {
+        guard currentState == .idle, let blankSubmissionAt else { return false }
+        if isWithinSubmissionWindow(date, submittedAt: blankSubmissionAt) { return true }
+        self.blankSubmissionAt = nil
+        return false
     }
 
     mutating func settleIfQuiet(
@@ -163,17 +305,9 @@ struct TerminalExecutionTracker {
               now.timeIntervalSince(lastActivityAt) >= quietInterval
         else { return currentState }
         runningSource = nil
+        pendingOutputStart = nil
+        blankSubmissionAt = nil
         return .done
-    }
-
-    /// Restart the quiet window of an activity-sourced run. Used on the
-    /// occluded→visible edge: a parked renderer emits no heartbeats, so the
-    /// elapsed silence says nothing about completion — and a false `.done`
-    /// would stick, because activity can never revive `.done` (see
-    /// `markTerminalActivity`).
-    mutating func refreshActivityWindow(now: Date) {
-        guard case .activity = runningSource else { return }
-        runningSource = .activity(now)
     }
 
     mutating func refreshForeground(
@@ -181,13 +315,24 @@ struct TerminalExecutionTracker {
         pid: pid_t?,
         foregroundIsShell: Bool,
         terminalInputIsRaw: Bool,
+        at date: Date = Date(),
         currentState: TerminalExecutionState
     ) -> TerminalExecutionState {
         let newKey = foregroundIsShell ? nil : ForegroundProcessKey(name: name, pid: pid)
+        let changed = newKey != lastForeground
+        let returnedToCanonical = !changed
+            && lastTerminalInputWasRaw == true
+            && !terminalInputIsRaw
+        lastTerminalInputWasRaw = newKey == nil ? nil : terminalInputIsRaw
+        // An authoritative process transition supersedes output heuristics. A
+        // steady raw Pi pid deliberately preserves the submission candidate.
+        if changed {
+            pendingOutputStart = nil
+            blankSubmissionAt = nil
+        }
 
-        // Resolve a pending progress quiesce: the first foreground process
-        // after a progress race (progress cleared before any poll) is quiesced
-        // rather than marked running. A shell arriving first cancels it.
+        // Resolve the race where progress cleared before a foreground poll: the
+        // first process is quiesced rather than immediately restarted.
         if pendingProgressQuiesce {
             if let newKey {
                 progressQuiesced = newKey
@@ -198,45 +343,50 @@ struct TerminalExecutionTracker {
             pendingProgressQuiesce = false
         }
 
-        // Drop the quiesce once the foreground moves off the quiesced process.
+        // A different foreground process releases progress quiescing.
         if let progressQuiesced, progressQuiesced != newKey {
             self.progressQuiesced = nil
         }
 
-        let changed = newKey != lastForeground
         lastForeground = newKey
 
-        // Foreground returned to the shell: a foreground-running command exited.
+        // Returning to the shell is the authoritative completion edge for a
+        // foreground command, regardless of whether it was later demoted to
+        // activity ownership by a canonical→raw transition.
         if newKey == nil {
             guard changed, currentState == .running else { return currentState }
             runningSource = nil
             return .done
         }
 
-        // Explicit progress owns the state while active.
+        // Explicit progress owns state while active. Startup foreground noise
+        // remains ignored until the pane has received trusted input.
         if runningSource == .progress { return currentState }
-
-        // A newly-created/restored plain shell can briefly look like a non-shell
-        // foreground while its startup files and shell integration settle. Do
-        // not turn that launch noise into a persisted checkmark. Once the user
-        // has interacted, foreground transitions are real user work.
         guard hasUserInteraction else { return currentState }
 
         if terminalInputIsRaw {
-            // Raw/cbreak-mode programs (editors, multiplexers, interactive CLIs)
-            // should not be held running by foreground alone. If a canonical
-            // command switched the tty raw, finish that foreground-only run;
-            // activity-sourced runs still quiet-settle normally.
+            // A TUI switching canonical→raw is still working. Demote its
+            // foreground-owned run so IO heartbeats keep it alive and quiet
+            // output can settle it, rather than marking it done immediately.
             if currentState == .running, runningSource == .foreground {
-                runningSource = nil
-                return .done
+                runningSource = .activity(date)
             }
             return currentState
         }
 
-        // Canonical non-shell command (a build, `sleep`, shell script, …) →
-        // running until it returns to the shell. Only act on a change so a
-        // settled idle process doesn't flip back to running on every poll.
+        // A same-pid TUI can return from raw to canonical mode while it keeps
+        // working. Restore foreground authority only while it is still
+        // running; a same-pid process that already quiet-settled must not be
+        // resurrected by a later poll.
+        if returnedToCanonical, currentState == .running,
+           case .activity = runningSource
+        {
+            runningSource = .foreground
+            return currentState
+        }
+
+        // A canonical non-shell command is foreground-owned until its process
+        // changes. Re-polls of the same pid must not restart settled state.
         guard changed else { return currentState }
         runningSource = .foreground
         return .running
@@ -357,6 +507,12 @@ final class Pane: Identifiable {
 
     @ObservationIgnored
     private var executionTracker = TerminalExecutionTracker()
+    /// The global foreground poll pauses when the app has no visible window.
+    /// Keep one lightweight wake scheduled from the final IO heartbeat so an
+    /// occluded activity-owned run can still quiet-settle.
+    @ObservationIgnored
+    private var activityQuietPollWork: DispatchWorkItem?
+    private let activityQuietPollDelay: TimeInterval
 
     /// Re-read the foreground process name from the process table and publish it
     /// only when it changed (so a steady poll doesn't churn `@Observable` and
@@ -436,16 +592,22 @@ final class Pane: Identifiable {
 
     func markCommandRunning() {
         executionState = executionTracker.markProgressStarted(currentState: executionState)
+        cancelActivityQuietPollIfNeeded()
     }
 
     func markCommandFinished() {
         executionState = executionTracker.markCommandFinished(currentState: executionState)
+        cancelActivityQuietPollIfNeeded()
     }
 
     func markProgressFinished() {
         executionState = executionTracker.markProgressFinished(currentState: executionState)
+        cancelActivityQuietPollIfNeeded()
     }
 
+    /// The row-growth activity primitive that `markOutputActivity` delegates
+    /// to on a growing heartbeat. Exposed directly so tests can seed an
+    /// activity-sourced run at a chosen instant without a growth baseline.
     func markTerminalActivity(at date: Date = Date()) {
         executionState = executionTracker.markTerminalActivity(
             at: date,
@@ -453,16 +615,56 @@ final class Pane: Identifiable {
         )
     }
 
-    func settleTerminalActivityIfQuiet(now: Date = Date(), quietInterval: TimeInterval = 3) {
+    func settleTerminalActivityIfQuiet(
+        now: Date = Date(),
+        quietInterval: TimeInterval = TerminalActivityTiming.quietInterval
+    ) {
         executionState = executionTracker.settleIfQuiet(
             now: now,
             quietInterval: quietInterval,
             currentState: executionState
         )
+        cancelActivityQuietPollIfNeeded()
     }
 
-    func refreshTerminalActivityWindow(now: Date = Date()) {
-        executionTracker.refreshActivityWindow(now: now)
+    /// Handle a throttled `OUTPUT_ACTIVITY` heartbeat — the pane's sole source
+    /// of terminal activity. It fires from the pty IO path (not the renderer),
+    /// so unlike the scrollbar it also reaches occluded/background panes and
+    /// its silence is always meaningful. `setup.sh` requires the GhosttyKit
+    /// ABI that emits it, so the quiet-settle needs no occluded-pane exemption.
+    /// Growth-vs-keepalive is decided in `TerminalExecutionTracker`.
+    func markOutputActivity(totalRows: UInt64, now: Date = Date()) {
+        executionState = executionTracker.markOutputActivity(totalRows: totalRows, at: now, currentState: executionState)
+        scheduleActivityQuietPollIfNeeded()
+    }
+
+    private func scheduleActivityQuietPollIfNeeded() {
+        guard executionTracker.isActivitySourced else {
+            cancelActivityQuietPollIfNeeded()
+            return
+        }
+        // Rescheduled on every heartbeat (~2 Hz per live pane), so this uses a
+        // plain work item rather than spawning and cancelling a `Task` each
+        // time — the same idiom the view's `commandSubmissionEvidenceReset`
+        // uses.
+        activityQuietPollWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            activityQuietPollWork = nil
+            // This dedicated deadline bypasses ordinary event coalescing: if
+            // every window is occluded there may be no timer left to retry.
+            // AppState still performs the settle so acknowledgement and
+            // persistence stay central.
+            NotificationCenter.default.post(name: .terminalQuietSettleDeadline, object: self)
+        }
+        activityQuietPollWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + activityQuietPollDelay, execute: work)
+    }
+
+    private func cancelActivityQuietPollIfNeeded() {
+        guard !executionTracker.isActivitySourced else { return }
+        activityQuietPollWork?.cancel()
+        activityQuietPollWork = nil
     }
 
     @discardableResult
@@ -490,6 +692,29 @@ final class Pane: Identifiable {
         NotificationCenter.default.post(name: .terminalPollEvent, object: nil)
     }
 
+    /// True when a recognized AI agent holds the foreground. Two things key off
+    /// it: the two-heartbeat in-place start heuristic (below), and the view's
+    /// decision to carry a programmatic payload's content evidence forward —
+    /// both are only meaningful in a raw-mode agent TUI, where a bracketed
+    /// paste can leave the payload sitting unsubmitted in the editor buffer.
+    var allowsInPlaceOutputStart: Bool {
+        agentIcon != nil || AgentIcon.match(processName: foregroundProcessName) != nil
+    }
+
+    func recordCommandSubmission(hasContent: Bool, at date: Date = Date()) {
+        // Plain Return is ambiguous in editors and menus. Only a nonempty
+        // submission in a recognized AI agent gets the two-heartbeat in-place
+        // start heuristic; ordinary programs still use process/row evidence.
+        let allowInPlaceOutputStart = allowsInPlaceOutputStart
+        executionTracker.recordCommandSubmission(
+            at: date,
+            allowInPlaceOutputStart: allowInPlaceOutputStart,
+            hasContent: hasContent
+        )
+        acknowledgeCommandCompletion()
+        NotificationCenter.default.post(name: .terminalPollEvent, object: nil)
+    }
+
     private func applyForegroundExecutionState(
         name: String?,
         foregroundPID: pid_t?,
@@ -503,6 +728,7 @@ final class Pane: Identifiable {
             terminalInputIsRaw: terminalInputIsRaw,
             currentState: executionState
         )
+        cancelActivityQuietPollIfNeeded()
     }
 
     /// Handle an OSC 0/2 title reported by the surface. Always refreshes the
@@ -650,13 +876,13 @@ final class Pane: Identifiable {
         view.onSearchSelected = nil
         view.onFocus = nil
         view.onInteraction = nil
+        view.onCommandSubmitted = nil
         view.onSplitRequest = nil
         view.onDesktopNotification = nil
         view.onCommandFinished = nil
         view.onProgressStarted = nil
         view.onProgressFinished = nil
-        view.onTerminalActivity = nil
-        view.onTerminalRender = nil
+        view.onOutputActivity = nil
         view.onScrollbarUpdate = nil
         view.onScrollWheel = nil
         view.destroySurface()
@@ -725,7 +951,8 @@ final class Pane: Identifiable {
         sessionName persistedSessionName: String? = nil,
         command: String? = nil,
         shell: String? = nil,
-        env: [String: String]? = nil
+        env: [String: String]? = nil,
+        activityQuietPollDelay: TimeInterval = TerminalActivityTiming.quietPollDelay
     ) {
         self.projectPath = projectPath
         self.projectID = projectID
@@ -756,6 +983,7 @@ final class Pane: Identifiable {
         self.command = command
         self.shell = shell
         self.env = env
+        self.activityQuietPollDelay = activityQuietPollDelay
         executionTracker = TerminalExecutionTracker(hasUserInteraction: command != nil)
     }
 

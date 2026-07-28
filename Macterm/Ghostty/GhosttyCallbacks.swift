@@ -68,12 +68,16 @@ final class GhosttyCallbacks: @unchecked Sendable {
             let s = action.action.scrollbar
             DispatchQueue.main.async { view.surfaceDidUpdateScrollbar(total: s.total, offset: s.offset, len: s.len) }
             return true
-        case GHOSTTY_ACTION_RENDER:
-            guard let view = surfaceView(from: target) else { return false }
-            DispatchQueue.main.async { view.surfaceDidRender() }
-            // Do not consume the action: keep libghostty's existing render path
-            // unchanged, and use this only as an activity signal.
-            return false
+        case GHOSTTY_ACTION_OUTPUT_ACTIVITY:
+            // Throttled heartbeat from the pty IO path — fires while the
+            // program produces output, even when the surface is occluded and
+            // the renderer (and thus the scrollbar action) is parked. Carries
+            // the same geometry as GHOSTTY_ACTION_SCROLLBAR so the tracker can
+            // tell real output growth from in-place redraws.
+            guard let view = surfaceView(from: target) else { return true }
+            let s = action.action.output_activity
+            DispatchQueue.main.async { view.surfaceDidOutputActivity(total: s.total, offset: s.offset, len: s.len) }
+            return true
         case GHOSTTY_ACTION_RELOAD_CONFIG:
             // libghostty fires this (with soft = true) when a surface's
             // conditional state changes — notably on set_color_scheme, which
@@ -117,8 +121,18 @@ final class GhosttyCallbacks: @unchecked Sendable {
         // `ghostty_surface_complete_clipboard_request`'s surface parameter is
         // non-null on the Zig side; a request completing during surface
         // teardown (nil `surface`) is UB, not a graceful no-op. Guard it.
-        guard let surface = surface(from: ud) else { return false }
+        guard let view = surfaceView(from: ud), let surface = view.surface else { return false }
         let text = Self.readPasteboardText() ?? ""
+        // Record the resolved payload, not just the Command-V key code: an
+        // empty/whitespace clipboard must not make a later blank Return look
+        // like a nonempty agent submission.
+        //
+        // Dispatched async BEFORE the synchronous completion below, which is
+        // the ordering the evidence depends on: the main queue runs the record
+        // after this callback returns — so after the paste has reached the
+        // surface — but still before any Return the user types next. Moving it
+        // after the completion call, or making it synchronous, breaks that.
+        DispatchQueue.main.async { view.surfaceDidPasteText(text) }
         text.withCString { ghostty_surface_complete_clipboard_request(surface, $0, state, false) }
         return true
     }
@@ -335,8 +349,15 @@ final class GhosttyCallbacks: @unchecked Sendable {
         return Unmanaged<GhosttyTerminalNSView>.fromOpaque(ud).takeUnretainedValue()
     }
 
-    private func surface(from ud: UnsafeMutableRawPointer?) -> ghostty_surface_t? {
+    /// Recover the view from a libghostty userdata pointer. Every callback that
+    /// needs one goes through here so the unmanaged pointer cast lives in a
+    /// single place.
+    private func surfaceView(from ud: UnsafeMutableRawPointer?) -> GhosttyTerminalNSView? {
         guard let ud else { return nil }
-        return Unmanaged<GhosttyTerminalNSView>.fromOpaque(ud).takeUnretainedValue().surface
+        return Unmanaged<GhosttyTerminalNSView>.fromOpaque(ud).takeUnretainedValue()
+    }
+
+    private func surface(from ud: UnsafeMutableRawPointer?) -> ghostty_surface_t? {
+        surfaceView(from: ud)?.surface
     }
 }

@@ -241,13 +241,23 @@ struct PaneTests {
     }
 
     @Test
-    func rawForegroundProcess_settlesExistingForegroundOnlyRun() {
+    func rawForegroundProcess_demotesExistingForegroundOnlyRun_thenSettlesWhenQuiet() {
+        // A TUI that spawns canonical, prints, then goes raw (claude, pi) is
+        // *starting* its work, not finishing — the raw switch demotes the
+        // foreground-owned run to the activity source instead of completing
+        // it outright, so it stays `.running` until output actually goes
+        // quiet rather than locking the pane `.done` for the whole session.
         let p = Pane(projectPath: "/", projectID: UUID())
         p.recordUserInteraction()
         p.applyForegroundRefresh(name: "node", foregroundPID: 42)
         #expect(p.executionState == .running)
 
         p.applyForegroundRefresh(name: "node", foregroundPID: 42, terminalInputIsRaw: true)
+        #expect(p.executionState == .running)
+
+        // No further output: the demoted run quiet-settles like any other
+        // activity-sourced run.
+        p.settleTerminalActivityIfQuiet(now: Date().addingTimeInterval(5), quietInterval: 3)
         #expect(p.executionState == .done)
     }
 
@@ -287,16 +297,107 @@ struct PaneTests {
     }
 
     @Test
-    func foregroundProcessWithOutput_settlesAfterQuiet_withoutRestartingSameProcess() {
+    func commandSubmissionStartsOnSecondInPlaceOutputHeartbeatForAgent() {
+        let p = Pane(projectPath: "/", projectID: UUID())
+        p.foregroundProcessName = "pi"
+        let submittedAt = Date(timeIntervalSince1970: 100)
+        p.recordCommandSubmission(hasContent: true, at: submittedAt)
+        p.markOutputActivity(totalRows: 10, now: submittedAt.addingTimeInterval(0.5))
+        #expect(p.executionState == .idle)
+        p.markOutputActivity(totalRows: 10, now: submittedAt.addingTimeInterval(1))
+        #expect(p.executionState == .running)
+    }
+
+    /// The view carries a programmatic payload's content evidence past the
+    /// submission that consumed it only when this is true — otherwise a
+    /// `pane run "…"` followed within the carry window by a genuinely blank
+    /// Return would report content it doesn't have.
+    @Test
+    func inPlaceOutputStartIsAllowedOnlyForAnAgentForeground() {
+        let p = Pane(projectPath: "/", projectID: UUID())
+        #expect(!p.allowsInPlaceOutputStart)
+        p.foregroundProcessName = "zsh"
+        #expect(!p.allowsInPlaceOutputStart)
+        p.foregroundProcessName = "pi"
+        #expect(p.allowsInPlaceOutputStart)
+    }
+
+    @Test
+    func commandSubmissionDoesNotArmInPlaceOutputForOrdinaryRawProgram() {
+        let p = Pane(projectPath: "/", projectID: UUID())
+        p.foregroundProcessName = "nvim"
+        let submittedAt = Date(timeIntervalSince1970: 100)
+        p.recordCommandSubmission(hasContent: true, at: submittedAt)
+        p.markOutputActivity(totalRows: 10, now: submittedAt.addingTimeInterval(0.5))
+        p.markOutputActivity(totalRows: 10, now: submittedAt.addingTimeInterval(1))
+        #expect(p.executionState == .idle)
+    }
+
+    @Test
+    func blankSubmissionSuppressesImmediateGrowthAndScrollbarActivity() {
+        let p = Pane(projectPath: "/", projectID: UUID())
+        let submittedAt = Date(timeIntervalSince1970: 100)
+        p.markOutputActivity(totalRows: 10, now: submittedAt.addingTimeInterval(-1))
+        p.recordCommandSubmission(hasContent: false, at: submittedAt)
+
+        p.markOutputActivity(totalRows: 20, now: submittedAt.addingTimeInterval(0.25))
+        p.markTerminalActivity(at: submittedAt.addingTimeInterval(0.5))
+        #expect(p.executionState == .idle)
+    }
+
+    @Test
+    func outputActivitySchedulesQuietPollWake() async {
+        let p = Pane(projectPath: "/", projectID: UUID(), activityQuietPollDelay: 0.02)
+        p.recordUserInteraction()
+        p.markOutputActivity(totalRows: 10)
+
+        await confirmation("quiet output wakes the paused poll") { confirm in
+            var fired = false
+            let token = NotificationCenter.default.addObserver(
+                forName: .terminalQuietSettleDeadline,
+                object: p,
+                queue: .main
+            ) { _ in
+                fired = true
+                confirm()
+            }
+            defer { NotificationCenter.default.removeObserver(token) }
+
+            p.markOutputActivity(totalRows: 20)
+            // Poll rather than sleeping a fixed multiple of the delay: a
+            // co-scheduled spike on a loaded CI runner can push a 20ms timer
+            // well past any fixed margin (cf. #181). The generous ceiling only
+            // bounds a genuine failure; a healthy run exits on the first tick.
+            for _ in 0 ..< 200 where !fired {
+                try? await Task.sleep(for: .milliseconds(25))
+            }
+        }
+    }
+
+    /// The scheduled wake must land strictly *after* the quiet threshold it
+    /// needs to observe as crossed — a wake at exactly the threshold only
+    /// settles while timer jitter runs positive, and an occluded window has no
+    /// other timer left to retry with.
+    @Test
+    func quietPollWakeLandsAfterTheSettleThreshold() {
+        #expect(TerminalActivityTiming.quietPollDelay > TerminalActivityTiming.quietInterval)
+        #expect(
+            TerminalActivityTiming.quietPollDelay
+                == TerminalActivityTiming.quietInterval + TerminalActivityTiming.quietPollMargin
+        )
+    }
+
+    @Test
+    func foregroundProcessWithOutput_remainsRunningUntilItReturnsToShell() {
         let p = Pane(projectPath: "/", projectID: UUID())
         let start = Date(timeIntervalSince1970: 100)
         p.recordUserInteraction()
         p.applyForegroundRefresh(name: "node", foregroundPID: 42)
         p.markTerminalActivity(at: start)
+        p.settleTerminalActivityIfQuiet(now: start.addingTimeInterval(30), quietInterval: 3)
         #expect(p.executionState == .running)
-        p.settleTerminalActivityIfQuiet(now: start.addingTimeInterval(3), quietInterval: 3)
-        #expect(p.executionState == .done)
-        p.applyForegroundRefresh(name: "node", foregroundPID: 42)
+
+        p.applyForegroundRefresh(name: shellName(), foregroundPID: 43, foregroundIsShell: true)
         #expect(p.executionState == .done)
     }
 

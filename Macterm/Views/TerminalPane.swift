@@ -131,6 +131,13 @@ private struct TerminalSurface: NSViewRepresentable {
         view.onInteraction = { [weak pane] in
             pane?.recordUserInteraction()
         }
+        // Order matters: `onInteraction` clears the tracker's in-place start
+        // arming that `onCommandSubmitted` sets, and the view calls them in
+        // that order. See `GhosttyTerminalNSView.onCommandSubmitted`.
+        view.onCommandSubmitted = { [weak pane] hasContent in
+            pane?.recordCommandSubmission(hasContent: hasContent)
+        }
+        view.canCarryCommandInput = { [weak pane] in pane?.allowsInPlaceOutputStart ?? false }
         view.onProcessExit = onProcessExit
         view.onSplitRequest = onSplitRequest
         view.onZoomRequest = onZoomRequest
@@ -205,22 +212,18 @@ private struct TerminalSurface: NSViewRepresentable {
             pane.markProgressFinished()
             onCommandFinished()
         }
-        view.onTerminalActivity = { [weak pane] in
+        view.onOutputActivity = { [weak pane] total in
             guard let pane, Preferences.shared.showTabStatusIndicator else { return }
+            // The single activity source. Output heartbeats fire from the pty
+            // IO path regardless of occlusion, so they also reach background
+            // tabs, and they carry the row total so the tracker can tell
+            // growth from an in-place redraw. Always refresh foreground/raw
+            // state first: a running canonical command can switch to a raw TUI
+            // while normal polling is paused behind a fully occluded window.
+            // The heartbeat is throttled to ~2 Hz, and the tracker preserves
+            // foreground/progress authority until that raw transition occurs.
             pane.refreshForegroundProcess()
-            pane.markTerminalActivity()
-        }
-        view.onTerminalRender = { [weak pane] in
-            guard let pane, Preferences.shared.showTabStatusIndicator else { return }
-            // Renders also happen for prompt redraws and input echo. Use them to
-            // keep an already-detected command active (including in-place
-            // spinners), but don't let a render alone start the status spinner.
-            if pane.executionState != .running {
-                pane.refreshForegroundProcess()
-            }
-            if pane.executionState == .running {
-                pane.markTerminalActivity()
-            }
+            pane.markOutputActivity(totalRows: total)
         }
         view.onCommandFinished = { [weak pane, weak view] exitCode, durationNs in
             guard let pane else { return }
