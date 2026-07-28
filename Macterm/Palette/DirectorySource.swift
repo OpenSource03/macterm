@@ -4,7 +4,8 @@ import Foundation
 /// Palette source for directory completions. Consulted only when the query
 /// looks like a path. If the exact path matches a directory, it's surfaced
 /// as the top result — and if that directory is already an opened project,
-/// the item switches to it instead of creating a duplicate.
+/// the top item switches to it, with an "add another project" item below
+/// (a directory is not an identity; it can back several projects).
 @MainActor
 struct DirectorySource: PaletteSource {
     func items(query: String, context: PaletteContext) -> [PaletteItem] {
@@ -12,7 +13,7 @@ struct DirectorySource: PaletteSource {
         // (#104). No filesystem browsing — the host isn't consulted; the
         // exact spec is the offer.
         if PaletteQuery.isRemoteSpecQuery(query) {
-            return [remoteItem(spec: query, context: context)]
+            return remoteItems(spec: query, context: context)
         }
         let expanded = (query as NSString).expandingTildeInPath
         guard expanded.hasPrefix("/") else { return [] }
@@ -36,20 +37,38 @@ struct DirectorySource: PaletteSource {
 
         var items: [PaletteItem] = []
 
-        // Exact match at the top (when the typed path is itself a directory).
-        if let exact = exactMatch {
-            let name = (exact as NSString).lastPathComponent
+        // Every project-backed directory row pairs switch-first with an
+        // "add another project" row directly below — the exact typed path
+        // AND child completions alike. A directory is not an identity, so
+        // adding a second project must not require typing the full path
+        // (a prefix that narrows to one child would otherwise offer only
+        // the switch). `score` is a running counter so pairs stay adjacent
+        // and ordering stays deterministic.
+        var score = 0
+        func appendRows(name: String, fullPath: String) {
+            let existing = context.projectStore.project(matchingPath: fullPath)
             items.append(directoryItem(
                 name: name,
-                fullPath: exact,
-                existing: context.projectStore.project(matchingPath: exact),
+                fullPath: fullPath,
+                existing: existing,
                 context: context,
-                score: 0
+                score: score
             ))
+            score += 1
+            if existing != nil {
+                items.append(newProjectItem(name: name, fullPath: fullPath, context: context, score: score))
+                score += 1
+            }
         }
 
+        // Exact match at the top (when the typed path is itself a directory).
+        if let exact = exactMatch {
+            appendRows(name: (exact as NSString).lastPathComponent, fullPath: exact)
+        }
+
+        // Children rank below every exact-match row.
         let entries = (try? fm.contentsOfDirectory(atPath: dir)) ?? []
-        let children = entries
+        entries
             .filter { name in
                 let full = (dir as NSString).appendingPathComponent(name)
                 var childIsDir: ObjCBool = false
@@ -62,22 +81,14 @@ struct DirectorySource: PaletteSource {
             }
             // `contentsOfDirectory` order is unspecified; sort so BOTH which 10
             // children survive the cap AND their ranking are deterministic
-            // across runs and filesystems.
+            // across runs and filesystems. The cap counts directories, not
+            // rows — a backed child's add-another row rides along.
             .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
             .prefix(10)
-            .enumerated()
-            .map { offset, name -> PaletteItem in
-                let full = (dir as NSString).appendingPathComponent(name)
-                return directoryItem(
-                    name: name,
-                    fullPath: full,
-                    existing: context.projectStore.project(matchingPath: full),
-                    context: context,
-                    score: offset + 1
-                )
+            .forEach { name in
+                appendRows(name: name, fullPath: (dir as NSString).appendingPathComponent(name))
             }
 
-        items += children
         return items
     }
 
@@ -85,23 +96,13 @@ struct DirectorySource: PaletteSource {
         nil
     }
 
-    /// Add-or-switch for a typed remote spec, shaped like `directoryItem`:
-    /// an existing project matching the spec (structurally, via
-    /// `ProjectPath.matches`) switches; otherwise the item creates the
-    /// remote project. The display name is the remote directory's basename,
-    /// falling back to the host for `host:~` / `host:/`.
-    private func remoteItem(spec: String, context: PaletteContext) -> PaletteItem {
-        if let existing = context.projectStore.projects.first(where: { ProjectPath.matches($0.path, spec) }) {
-            return PaletteItem(
-                id: "remote-switch:\(spec)",
-                title: existing.name,
-                subtitle: "Switch to remote project: \(spec)",
-                category: "Directories",
-                score: 0
-            ) { [appState = context.appState] in
-                appState.selectProject(existing)
-            }
-        }
+    /// Items for a typed remote spec, shaped like the local exact match: an
+    /// existing project matching the spec (structurally, via
+    /// `ProjectPath.matches`) switches, with an add-another item below;
+    /// otherwise a single item creates the remote project. The display name
+    /// is the remote directory's basename, falling back to the host for
+    /// `host:~` / `host:/`.
+    private func remoteItems(spec: String, context: PaletteContext) -> [PaletteItem] {
         let base = (spec as NSString).lastPathComponent
         let name: String = if base.isEmpty || base == "~" || base == "/" || base == spec {
             ProjectPath.remote(from: spec).flatMap {
@@ -110,7 +111,19 @@ struct DirectorySource: PaletteSource {
         } else {
             base
         }
-        return PaletteItem(
+        if let existing = context.projectStore.projects.first(where: { ProjectPath.matches($0.path, spec) }) {
+            let switchItem = PaletteItem(
+                id: "remote-switch:\(spec)",
+                title: existing.name,
+                subtitle: "Switch to remote project: \(spec)",
+                category: "Directories",
+                score: 0
+            ) { [appState = context.appState] in
+                appState.selectProject(existing)
+            }
+            return [switchItem, newProjectItem(name: name, fullPath: spec, context: context, score: 1)]
+        }
+        let addItem = PaletteItem(
             id: "remote-open:\(spec)",
             title: name,
             subtitle: "Add remote project: \(spec)",
@@ -123,6 +136,7 @@ struct DirectorySource: PaletteSource {
             )
             appState.selectProject(project)
         }
+        return [addItem]
     }
 
     private func directoryItem(
@@ -151,6 +165,31 @@ struct DirectorySource: PaletteSource {
             score: score
         ) { [appState = context.appState, projectStore = context.projectStore] in
             let project = projectStore.findOrCreate(
+                name: name,
+                path: fullPath
+            )
+            appState.selectProject(project)
+        }
+    }
+
+    /// Offered directly below any switch item whose directory (local or
+    /// remote) already backs a project: a directory is not an identity, so a
+    /// second, independent project there is a legitimate ask. Always creates
+    /// (`ProjectStore.create`), mirroring the folder picker.
+    private func newProjectItem(
+        name: String,
+        fullPath: String,
+        context: PaletteContext,
+        score: Int
+    ) -> PaletteItem {
+        PaletteItem(
+            id: "dir-new:\(fullPath)",
+            title: name,
+            subtitle: "Add another project: \(fullPath)",
+            category: "Directories",
+            score: score
+        ) { [appState = context.appState, projectStore = context.projectStore] in
+            let project = projectStore.create(
                 name: name,
                 path: fullPath
             )
