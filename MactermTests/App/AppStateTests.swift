@@ -813,6 +813,126 @@ struct AppStateTests {
         #expect(files.find(forProjectPath: dir.path) == nil)
     }
 
+    // MARK: - Action toasts
+
+    @Test
+    func save_layout_toasts_with_the_full_path_it_wrote() throws {
+        let files = makeProjectFileStore()
+        let state = makeAppState(projectFiles: files)
+        let (project, _) = seedProjectWithDir(state) // name "proj" → proj.yaml
+
+        state.saveLayoutPresentingError(project)
+
+        #expect(state.pendingLayoutError == nil)
+        #expect(state.activeToast?.title == "Layout saved")
+        // The full path, not just the filename: the projects directory isn't
+        // somewhere the user necessarily has in mind, so the subtitle has to
+        // say where to go look — while still naming *which* file a save with
+        // several same-path candidates landed in.
+        let subtitle = try #require(state.activeToast?.subtitle)
+        #expect(subtitle.hasSuffix("proj.yaml"))
+        #expect(subtitle.contains("/"))
+        #expect(subtitle == ProjectPath.homeContracted(files.directoryURL.appendingPathComponent("proj.yaml").path))
+    }
+
+    @Test
+    func save_layout_toast_contracts_the_home_prefix() {
+        // A path under home renders as `~/…` — readable, and it keeps the
+        // username out of screenshots. `homeContracted` is the same helper the
+        // written file's own `path:` uses, so the two can't drift.
+        let home = ProjectPath.currentHome
+        #expect(ProjectPath.homeContracted("\(home)/.config/macterm/projects/a.yaml")
+            == "~/.config/macterm/projects/a.yaml")
+        // Outside home, it passes through rather than mangling the path.
+        #expect(ProjectPath.homeContracted("/etc/macterm/a.yaml") == "/etc/macterm/a.yaml")
+    }
+
+    @Test
+    func save_layout_conflict_raises_a_dialog_instead_of_a_toast() {
+        // A stray file declaring the same path makes the save a *notice*, not a
+        // clean success. Toasting "Layout saved" alongside would undercut the
+        // dialog that explains what's wrong.
+        let files = makeProjectFileStore()
+        let state = makeAppState(projectFiles: files)
+        let (project, root) = seedProjectWithDir(state)
+        // Bare `path:` with no `name:` — files no project's slug owns, which is
+        // what makes them strays rather than a sibling's legitimate file. Two,
+        // mirroring `save_layout_lists_ignored_duplicates_when_the_save_wins`:
+        // the save claims one and reports the rest.
+        writeProjectFile("path: \(root)", in: files, filename: "aaa.yaml")
+        writeProjectFile("path: \(root)", in: files, filename: "zzz.yaml")
+
+        state.saveLayoutPresentingError(project)
+
+        #expect(state.pendingLayoutError != nil)
+        #expect(state.activeToast == nil)
+    }
+
+    @Test
+    func apply_layout_toasts_only_when_user_invoked() throws {
+        let files = makeProjectFileStore()
+        let state = makeAppState(projectFiles: files)
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("macterm-toastapply-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        writeProjectFile("path: \(dir.path)\ntabs:\n  - name: \"Dev\"\n", in: files)
+        let project = Project(name: "toast", path: dir.path, sortOrder: 0)
+        state.selectProject(project)
+
+        // The first-open seed fires unbidden — it must stay silent.
+        #expect(state.activeToast == nil)
+
+        state.applyLayoutPresentingError(project, confirming: true)
+
+        #expect(state.pendingLayoutError == nil)
+        #expect(state.activeToast?.title == "Layout applied")
+    }
+
+    @Test
+    func apply_layout_failure_raises_a_dialog_instead_of_a_toast() {
+        // No file declares this project's path — the command surfaces the
+        // error, and a success toast would flatly contradict it.
+        let state = makeAppState(projectFiles: makeProjectFileStore())
+        let (project, _) = seedProjectWithDir(state)
+
+        state.applyLayoutPresentingError(project, confirming: true)
+
+        #expect(state.pendingLayoutError != nil)
+        #expect(state.activeToast == nil)
+    }
+
+    @Test
+    func dismissing_a_superseded_toast_leaves_the_newer_one_up() {
+        // The auto-dismiss task is keyed by toast id. A stale one firing after
+        // a second toast replaced the first must not cut the new one short.
+        let state = makeAppState()
+        state.presentToast("First")
+        let first = try? #require(state.activeToast?.id)
+        state.presentToast("Second")
+
+        if let first { state.dismissToast(first) }
+
+        #expect(state.activeToast?.title == "Second")
+    }
+
+    @Test
+    func dismissing_the_current_toast_clears_it() {
+        let state = makeAppState()
+        state.presentToast("Only")
+        let id = state.activeToast?.id
+
+        if let id { state.dismissToast(id) }
+
+        #expect(state.activeToast == nil)
+    }
+
+    @Test
+    func a_subtitled_toast_stays_up_longer() {
+        // Two lines need more reading time than one.
+        #expect(Toast(title: "Bare").duration < Toast(title: "Detailed", subtitle: "more").duration)
+    }
+
     // MARK: - saveLayout duplicate conflicts
 
     @Test
