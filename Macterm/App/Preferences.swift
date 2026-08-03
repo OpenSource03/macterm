@@ -103,12 +103,6 @@ final class Preferences {
         }
     }
 
-    /// Start every tab of the focused project immediately (off-screen) rather
-    /// than only the active tab. Defaults to on.
-    var eagerlyStartProjectTabs: Bool {
-        didSet { defaults.set(eagerlyStartProjectTabs, forKey: Keys.eagerlyStartProjectTabs) }
-    }
-
     /// Multiplier applied to terminal scroll wheel / trackpad row deltas.
     var terminalScrollSpeed: Double {
         didSet { defaults.set(terminalScrollSpeed, forKey: Keys.terminalScrollSpeed) }
@@ -145,15 +139,6 @@ final class Preferences {
 
     var showNewProjectButton: Bool {
         didSet { defaults.set(showNewProjectButton, forKey: Keys.showNewProjectButton) }
-    }
-
-    /// When true, quitting Macterm kills every pane's zmx session so nothing
-    /// keeps running in the background. Default off — session persistence
-    /// (shells survive quit and reattach on relaunch) is the point, so quit
-    /// detaches rather than terminates. Macterm-side only; never touches the
-    /// ghostty config pipeline.
-    var terminateSessionsOnQuit: Bool {
-        didSet { defaults.set(terminateSessionsOnQuit, forKey: Keys.terminateSessionsOnQuit) }
     }
 
     /// Which appcast channel auto-updates come from. Read by `Updater`'s
@@ -390,7 +375,6 @@ final class Preferences {
     private init(defaults: UserDefaults) {
         self.defaults = defaults
         autoTilingEnabled = defaults.bool(forKey: Keys.autoTiling)
-        eagerlyStartProjectTabs = (defaults.object(forKey: Keys.eagerlyStartProjectTabs) as? Bool) ?? true
         terminalScrollSpeed = Self.clampScrollSpeed(defaults.double(forKey: Keys.terminalScrollSpeed), fallback: 1.0)
         paneDimOpacity = Self.clampPaneDimOpacity(
             (defaults.object(forKey: Keys.paneDimOpacity) as? Double) ?? 0.2
@@ -410,7 +394,6 @@ final class Preferences {
         showAgentIcons = defaults.object(forKey: Keys.showAgentIcons) as? Bool ?? true
         showTabStatusIndicator = defaults.object(forKey: Keys.showTabStatusIndicator) as? Bool ?? false
         showNewProjectButton = defaults.object(forKey: Keys.showNewProjectButton) as? Bool ?? true
-        terminateSessionsOnQuit = defaults.object(forKey: Keys.terminateSessionsOnQuit) as? Bool ?? false
         updateChannel = (defaults.string(forKey: Keys.updateChannel))
             .flatMap(UpdateChannel.init(rawValue:)) ?? .stable
         tabSwitcherVisibility = (defaults.string(forKey: Keys.tabSwitcherVisibility))
@@ -447,13 +430,21 @@ final class Preferences {
             defaults.removeObject(forKey: "macterm.input.optionAsAlt")
             defaults.set(true, forKey: Keys.migrationV2GhosttyConfigOwned)
         }
+        // Eager tab start and session persistence are both unconditional now,
+        // so their keys are dead. Drop the stored values rather than leave them
+        // to silently take effect again if anything is ever wired back onto
+        // those keys.
+        if !defaults.bool(forKey: Keys.migrationRetiredToggleKeys) {
+            defaults.removeObject(forKey: "macterm.eagerlyStartProjectTabs.enabled")
+            defaults.removeObject(forKey: "macterm.session.terminateOnQuit")
+            defaults.set(true, forKey: Keys.migrationRetiredToggleKeys)
+        }
     }
 
     // MARK: - UserDefaults keys
 
     enum Keys {
         static let autoTiling = "macterm.autoTiling.enabled"
-        static let eagerlyStartProjectTabs = "macterm.eagerlyStartProjectTabs.enabled"
         static let terminalScrollSpeed = "macterm.terminal.scrollSpeed"
         static let paneDimOpacity = "macterm.pane.dimOpacity"
         static let windowOpacity = "macterm.window.opacity"
@@ -470,10 +461,10 @@ final class Preferences {
         static let showAgentIcons = "macterm.sidebar.showAgentIcons"
         static let showTabStatusIndicator = "macterm.sidebar.showTabStatusIndicator"
         static let showNewProjectButton = "macterm.sidebar.showNewProjectButton"
-        static let terminateSessionsOnQuit = "macterm.session.terminateOnQuit"
         static let updateChannel = "macterm.updates.channel"
         static let tabSwitcherVisibility = "macterm.toolbar.tabSwitcherVisibility"
         static let tabSwitcherPosition = "macterm.toolbar.tabSwitcherPosition"
         static let migrationV2GhosttyConfigOwned = "macterm.migration.v2_ghostty_config_owned"
+        static let migrationRetiredToggleKeys = "macterm.migration.retired_toggle_keys"
     }
 }

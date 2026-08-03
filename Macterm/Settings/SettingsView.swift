@@ -381,13 +381,11 @@ extension View {
 // MARK: - General
 
 private struct GeneralSettings: View {
-    // Seeded from and written back through `Preferences` (the single
-    // UserDefaults seam that redirects to a wiped side-suite under XCTest).
-    // NOT `@AppStorage`, which binds to `UserDefaults.standard` — banned by the
-    // project, and it diverged from the `.onChange` write-through under test.
+    /// Seeded from and written back through `Preferences` (the single
+    /// UserDefaults seam that redirects to a wiped side-suite under XCTest).
+    /// NOT `@AppStorage`, which binds to `UserDefaults.standard` — banned by the
+    /// project, and it diverged from the `.onChange` write-through under test.
     @State private var autoTilingEnabled: Bool = Preferences.shared.autoTilingEnabled
-    @State private var eagerlyStartProjectTabs: Bool = Preferences.shared.eagerlyStartProjectTabs
-    @State private var terminateSessionsOnQuit: Bool = Preferences.shared.terminateSessionsOnQuit
 
     /// Why session persistence is inactive, when it is. Missing binary is a
     /// dev-build state; an over-budget socket path is an environment problem
@@ -456,27 +454,15 @@ private struct GeneralSettings: View {
                     }
                 Text("Distributes pane sizes evenly on split and close.")
                     .settingsCaption()
-
-                Toggle("Start all tabs of the focused project", isOn: $eagerlyStartProjectTabs)
-                    .onChange(of: eagerlyStartProjectTabs) { _, v in
-                        Preferences.shared.eagerlyStartProjectTabs = v
-                    }
-                Text("Runs every tab's processes when a project opens, not just the active tab.")
-                    .settingsCaption()
             }
 
-            Section("Session Persistence") {
-                Toggle("Quit terminals when Macterm quits", isOn: $terminateSessionsOnQuit)
-                    .onChange(of: terminateSessionsOnQuit) { _, v in
-                        Preferences.shared.terminateSessionsOnQuit = v
-                    }
-                Text("Off: shells keep running after you quit and reattach on next launch.")
-                    .settingsCaption()
-
-                // Persistence can be silently unavailable (Supacode shipped the
-                // same probe and users only noticed via a buried log line) —
-                // say so where the toggle lives.
-                if ZmxClient.live.executableURL() == nil {
+            // Shells always keep running after quit and reattach on the next
+            // launch — there's no setting, so the section exists only to report
+            // that persistence is unavailable. It can be silently so (Supacode
+            // shipped the same probe and users only noticed via a buried log
+            // line), which is the whole reason to say it in the UI at all.
+            if ZmxClient.live.executableURL() == nil {
+                Section("Session Persistence") {
                     Label {
                         Text(zmxUnavailableReason)
                     } icon: {
