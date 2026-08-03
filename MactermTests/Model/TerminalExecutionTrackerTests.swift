@@ -156,6 +156,147 @@ struct TerminalExecutionTrackerTests {
         #expect(state == .done)
     }
 
+    /// The reported case, end to end: `ls` completes, then a prompt hook forks.
+    /// The hook must not start a run at all — once started it can strand
+    /// indefinitely, because a foreground-owned run has no self-settling wake
+    /// and `PollCadence` stops the timer entirely for an occluded, inactive app
+    /// ("it refreshes state when I click on the app").
+    @Test
+    func promptHookAfterCompletion_cannotStartForegroundRun() {
+        var tracker = TerminalExecutionTracker()
+        let submittedAt = Date(timeIntervalSince1970: 100)
+        tracker.recordUserInteraction()
+        tracker.recordCommandSubmission(at: submittedAt, allowInPlaceOutputStart: false, hasContent: true)
+
+        // `ls` is a nushell builtin: no process ever holds the foreground, and
+        // OSC 133;D lands while the pane still reads idle.
+        var state = tracker.markCommandFinished(currentState: .idle)
+        #expect(state == .idle)
+
+        // Now the prompt hooks fork, exactly as `starship`/`mise`/`zoxide` do.
+        state = tracker.refreshForeground(
+            name: "starship", pid: 2, foregroundIsShell: false, terminalInputIsRaw: false,
+            at: submittedAt.addingTimeInterval(0.25), currentState: state
+        )
+        #expect(state == .idle)
+        state = tracker.refreshForeground(
+            name: "mise", pid: 3, foregroundIsShell: false, terminalInputIsRaw: false,
+            at: submittedAt.addingTimeInterval(0.5), currentState: state
+        )
+        #expect(state == .idle)
+
+        // A blank Return launches nothing, so it must not re-open the gate.
+        tracker.recordCommandSubmission(
+            at: submittedAt.addingTimeInterval(1), allowInPlaceOutputStart: false, hasContent: false
+        )
+        state = tracker.refreshForeground(
+            name: "starship", pid: 4, foregroundIsShell: false, terminalInputIsRaw: false,
+            at: submittedAt.addingTimeInterval(1.25), currentState: state
+        )
+        #expect(state == .idle)
+
+        // The next real submission does, and a genuine command still runs.
+        tracker.recordCommandSubmission(
+            at: submittedAt.addingTimeInterval(2), allowInPlaceOutputStart: false, hasContent: true
+        )
+        state = tracker.refreshForeground(
+            name: "sleep", pid: 5, foregroundIsShell: false, terminalInputIsRaw: false,
+            at: submittedAt.addingTimeInterval(2.25), currentState: state
+        )
+        #expect(state == .running)
+        state = tracker.markCommandFinished(currentState: state)
+        #expect(state == .done)
+    }
+
+    /// A shell with no OSC 133 integration (CI's bash 3.2) never reports a
+    /// completion, so the prompt gate must never arm and foreground detection
+    /// has to behave exactly as it did before it existed.
+    @Test
+    func withoutShellIntegration_foregroundDetectionIsUnchanged() {
+        var tracker = TerminalExecutionTracker()
+        tracker.recordUserInteraction()
+        var state = tracker.refreshForeground(
+            name: "sleep", pid: 42, foregroundIsShell: false, terminalInputIsRaw: false, currentState: .idle
+        )
+        #expect(state == .running)
+        state = tracker.refreshForeground(
+            name: "bash", pid: 7, foregroundIsShell: true, terminalInputIsRaw: false, currentState: state
+        )
+        #expect(state == .done)
+        // Still no D anywhere in this timeline: the next command runs normally.
+        state = tracker.refreshForeground(
+            name: "find", pid: 43, foregroundIsShell: false, terminalInputIsRaw: false, currentState: .idle
+        )
+        #expect(state == .running)
+    }
+
+    /// The reported "spinner lingers ~3s after `ls`" sequence, replayed exactly.
+    ///
+    /// In a hook-heavy shell (starship / mise / zoxide), returning to the prompt
+    /// briefly runs a real external process, which the poll can catch as a
+    /// foreground command. What happens next depends entirely on whether the
+    /// pane's own shell is recognized as a shell on the following poll — the
+    /// single value `ProcessInspector.foregroundProcessIsShell` returns, which
+    /// the `--execute` classification bug had stuck at `false` for every
+    /// nushell pane (see `ProcessInspectorTests`).
+    ///
+    /// Misclassified, the return-to-prompt looks like "a non-shell program went
+    /// raw", which demotes the run to activity ownership — exiting only through
+    /// the 3-second quiet-settle. Classified correctly it is the authoritative
+    /// completion edge and the run ends on the very next poll.
+    @Test
+    func promptHookRun_endsAtOncePerShellClassification_insteadOfQuietSettling() {
+        let submittedAt = Date(timeIntervalSince1970: 100)
+
+        func replay(shellIsRecognized: Bool) -> (
+            afterPrompt: TerminalExecutionState,
+            atTwoSeconds: TerminalExecutionState,
+            atFourSeconds: TerminalExecutionState
+        ) {
+            var tracker = TerminalExecutionTracker()
+            // Idle at the prompt: nushell holds the tty in raw mode for line editing.
+            var state = tracker.refreshForeground(
+                name: "nu", pid: 1, foregroundIsShell: shellIsRecognized, terminalInputIsRaw: true,
+                at: submittedAt.addingTimeInterval(-1), currentState: .idle
+            )
+            tracker.recordUserInteraction()
+            tracker.recordCommandSubmission(at: submittedAt, allowInPlaceOutputStart: false, hasContent: true)
+
+            // `ls` is a nushell builtin — it never appears as a process. The
+            // poll instead catches the pre-prompt hook, canonical and non-shell.
+            state = tracker.refreshForeground(
+                name: "starship", pid: 2, foregroundIsShell: false, terminalInputIsRaw: false,
+                at: submittedAt.addingTimeInterval(0.25), currentState: state
+            )
+            #expect(state == .running)
+
+            // Next poll: the prompt is back, raw mode again.
+            let promptAt = submittedAt.addingTimeInterval(0.5)
+            state = tracker.refreshForeground(
+                name: "nu", pid: 1, foregroundIsShell: shellIsRecognized, terminalInputIsRaw: true,
+                at: promptAt, currentState: state
+            )
+            let afterPrompt = state
+            let atTwo = tracker.settleIfQuiet(
+                now: promptAt.addingTimeInterval(2), quietInterval: 3, currentState: state
+            )
+            let atFour = tracker.settleIfQuiet(
+                now: promptAt.addingTimeInterval(4), quietInterval: 3, currentState: atTwo
+            )
+            return (afterPrompt, atTwo, atFour)
+        }
+
+        // The bug: the run survives the prompt and only clears on quiet-settle.
+        let buggy = replay(shellIsRecognized: false)
+        #expect(buggy.afterPrompt == .running)
+        #expect(buggy.atTwoSeconds == .running)
+        #expect(buggy.atFourSeconds == .done)
+
+        // Fixed: returning to the prompt IS the completion edge.
+        let fixed = replay(shellIsRecognized: true)
+        #expect(fixed.afterPrompt == .done)
+    }
+
     @Test
     func samePIDReturningToCanonicalRestoresForegroundAuthority() {
         var tracker = TerminalExecutionTracker()
