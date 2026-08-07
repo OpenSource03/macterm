@@ -23,9 +23,22 @@ struct MainWindow: View {
         // Read in body, not inside the toolbar builder, so the Observation
         // dependency is registered and a Settings change re-places the item.
         let switcherPosition = preferences.tabSwitcherPosition
+        // Hiding the window toolbar (#226) also drops the titlebar itself,
+        // traffic lights included — that's AppKit's behavior for a toolbar-less
+        // fullSizeContentView window, not something we do separately. Read in
+        // body so flipping the setting re-applies live.
+        let chromeHidden = preferences.hideTitleBar
         return NavigationSplitView(columnVisibility: $columnVisibility) {
             SidebarContent()
+                // Breathing room for the first row once the chrome is gone.
+                // Innermost, before `ignoresSafeArea`, so the padding insets
+                // the rows while the sidebar surface still reaches the edge.
+                .safeAreaPadding(.top, chromeHidden ? 8 : 0)
                 .navigationSplitViewColumnWidth(min: 140, ideal: 180, max: 280)
+                // Hiding the toolbar removes the chrome but SwiftUI keeps its
+                // titlebar safe-area inset reserved; ignoring it is what lets
+                // rows actually start at the window's top edge.
+                .ignoresSafeArea(chromeHidden ? .container : [], edges: .top)
         } detail: {
             ZStack {
                 // The window's NSWindow.backgroundColor (set by WindowAppearance)
@@ -45,6 +58,9 @@ struct MainWindow: View {
                     WelcomeView()
                 }
             }
+            // Same safe-area reclaim as the sidebar: without it the terminal
+            // keeps a blank strip where the hidden titlebar used to be.
+            .ignoresSafeArea(chromeHidden ? .container : [], edges: .top)
             .navigationTitle(activeProject?.name ?? appDisplayName)
             .navigationSubtitle(activeTabTitle)
             .onGeometryChange(for: CGFloat.self) { proxy in
@@ -73,7 +89,8 @@ struct MainWindow: View {
                 }
             }
         }
-        .background(WindowStyler())
+        .toolbar(chromeHidden ? .hidden : .visible, for: .windowToolbar)
+        .background(WindowStyler(hideTitle: chromeHidden))
         .overlay {
             if appState.isCommandPaletteVisible {
                 CommandPaletteOverlay()
@@ -358,6 +375,11 @@ struct ZoomIndicator: View {
 }
 
 private struct WindowStyler: NSViewRepresentable {
+    /// Mirrors `Preferences.hideTitleBar`. The toolbar hide is SwiftUI-side
+    /// (`.toolbar(.hidden, for: .windowToolbar)` in `MainWindow`); the title
+    /// text is an `NSWindow` property, so it's applied here.
+    var hideTitle: Bool = false
+
     func makeCoordinator() -> Coordinator {
         Coordinator()
     }
@@ -391,6 +413,7 @@ private struct WindowStyler: NSViewRepresentable {
             // Without this the titlebar floats above the sidebar with a
             // visible boundary, which is jarring when both are translucent.
             window.styleMask.insert(.fullSizeContentView)
+            window.titleVisibility = hideTitle ? .hidden : .visible
             WindowAppearance.sync(window: window)
             coordinator.observe(window: window)
             // Intercept the close button to hide instead of close,
@@ -399,7 +422,16 @@ private struct WindowStyler: NSViewRepresentable {
         }
     }
 
-    func updateNSView(_: NSView, context _: Context) {}
+    func updateNSView(_ view: NSView, context _: Context) {
+        // Follow live setting flips. Async because SwiftUI forbids window
+        // mutation from inside the update pass.
+        let hide = hideTitle
+        DispatchQueue.main.async {
+            guard let window = view.window else { return }
+            window.titleVisibility = hide ? .hidden : .visible
+            WindowAppearance.syncTitleBarHidden(window: window)
+        }
+    }
 
     final class Coordinator: NSObject, NSWindowDelegate {
         nonisolated(unsafe) private var observer: Any?
