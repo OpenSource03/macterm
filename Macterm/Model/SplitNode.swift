@@ -557,6 +557,19 @@ final class Pane: Identifiable {
     /// (`GHOSTTY_ACTION_MOUSE_OVER_LINK`). Live UI state only — never
     /// persisted.
     var hoverURL: String?
+
+    /// Bumped when the pane's scroll view finds itself orphaned with no
+    /// living container to heal into (#227 — SwiftUI can deallocate a
+    /// transient container outright, killing the weak re-attach pointer).
+    /// `TerminalPane` reads this, so a bump re-renders the pane's subtree and
+    /// `TerminalSurface.updateNSView` re-attaches on a container SwiftUI
+    /// guarantees is alive. The owner-of-last-resort for view attachment.
+    var surfaceReattachTick = 0
+
+    func requestSurfaceReattach() {
+        surfaceReattachTick &+= 1
+    }
+
     var executionState: TerminalExecutionState = .idle {
         didSet {
             guard executionState != oldValue else { return }
@@ -1003,6 +1016,10 @@ final class Pane: Identifiable {
         view.passwordInput = false
         view.destroySurface()
         let scroll = _scrollView
+        // Disarm the orphan-healing re-attach BEFORE the removal below —
+        // otherwise a destroyed pane would climb back into its old container.
+        scroll?.reattachHost = nil
+        scroll?.onOrphaned = nil
         _scrollView = nil
         _nsView = nil
         // Keep the NSView (and its scroll-view host) alive for a runloop tick so
@@ -1229,21 +1246,34 @@ extension SplitNode {
         direction: SplitDirection,
         position: SplitPosition
     ) -> (node: SplitNode, inserted: Bool) {
+        inserting(node: .pane(pane), at: destinationID, direction: direction, position: position)
+    }
+
+    /// Insert a whole subtree next to the pane `destinationID`, wrapping the
+    /// destination in a new split with `node` at `position`. Generalizes the
+    /// single-pane variant so a dragged tab's entire split tree can land beside
+    /// a pane in one structural move (its panes and surfaces reused as-is).
+    func inserting(
+        node: SplitNode,
+        at destinationID: UUID,
+        direction: SplitDirection,
+        position: SplitPosition
+    ) -> (node: SplitNode, inserted: Bool) {
         switch self {
         case let .pane(p) where p.id == destinationID:
-            let first: SplitNode = position == .first ? .pane(pane) : .pane(p)
-            let second: SplitNode = position == .first ? .pane(p) : .pane(pane)
+            let first: SplitNode = position == .first ? node : .pane(p)
+            let second: SplitNode = position == .first ? .pane(p) : node
             return (.split(SplitBranch(direction: direction, first: first, second: second)), true)
         case .pane:
             return (self, false)
         case let .split(branch):
             let (newFirst, ok1) = branch.first.inserting(
-                pane: pane, at: destinationID, direction: direction, position: position
+                node: node, at: destinationID, direction: direction, position: position
             )
             branch.first = newFirst
             if ok1 { return (.split(branch), true) }
             let (newSecond, ok2) = branch.second.inserting(
-                pane: pane, at: destinationID, direction: direction, position: position
+                node: node, at: destinationID, direction: direction, position: position
             )
             branch.second = newSecond
             return (.split(branch), ok2)
@@ -1360,8 +1390,9 @@ extension SplitNode {
 
     /// Number of "cells" this subtree contributes when laid out along the given
     /// direction. Same-direction descendants expand to their leaf count;
-    /// different-direction or leaf nodes count as a single cell.
-    private func tileUnits(along direction: SplitDirection) -> Int {
+    /// different-direction or leaf nodes count as a single cell. Also feeds
+    /// `TabDropPlacer`'s preview widths (#227).
+    func tileUnits(along direction: SplitDirection) -> Int {
         switch self {
         case .pane: 1
         case let .split(b):

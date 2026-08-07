@@ -465,6 +465,14 @@ final class QuickTerminalPanel: NSPanel {
 
 private struct QuickTerminalView: View {
     @Bindable var state: QuickTerminalSplitState
+    /// The pane currently dragged by its grab handle (`DraggingPaneKey`), so
+    /// the dragged pane's own leaf drops its target.
+    @State
+    private var draggedPaneID: UUID?
+    /// The live drop resolution the per-leaf pane targets report into; the
+    /// workspace-level overlay renders its preview.
+    @State
+    private var dropResolution: TabDropResolution?
 
     var body: some View {
         let renderedNode: SplitNode = {
@@ -490,12 +498,29 @@ private struct QuickTerminalView: View {
                 pane.acknowledgeCommandCompletion()
             },
             onToggleZoom: { state.tab.toggleZoom(paneID: $0) },
-            onMovePane: { source, destination, zone in
-                state.tab.movePane(source, onto: destination, zone: zone)
-            }
+            paneDrop: PaneDropContext(
+                root: renderedNode,
+                resolution: $dropResolution,
+                draggedPaneID: draggedPaneID,
+                onMovePane: { paneID, target in
+                    state.tab.movePane(paneID, to: target)
+                }
+            )
         )
         .id(renderedNode.id)
         .background(MactermTheme.bgWithOpacity)
+        // Grab-handle drags share the workspace drop grammar (whole-edge,
+        // divider, local). The context carries no tab handler: the quick
+        // terminal's ephemeral world doesn't adopt workspace tabs.
+        .overlay {
+            WorkspaceDropPreview(resolution: dropResolution)
+        }
+        .onPreferenceChange(DraggingPaneKey.self) { value in
+            MainActor.assumeIsolated {
+                draggedPaneID = value
+                if value == nil { dropResolution = nil }
+            }
+        }
         .overlay(alignment: .topTrailing) {
             if let zoomID = state.tab.zoomedPaneID {
                 ZoomIndicator(onExit: { state.tab.toggleZoom(paneID: zoomID) })

@@ -96,6 +96,11 @@ struct ControlArgs: Codable, Equatable {
     /// `ctrl+c`, `escape`, `up`, or `ctrl+\` — delivered through libghostty's
     /// key-encoding path, not the text-paste path `run` uses.
     var key: String?
+    /// Drop zone for the debug-only `pane.move`: `left`/`right`/`top`/`bottom`.
+    var zone: String?
+    /// Destination pane selector for `pane.move` (same tab); nil = the
+    /// workspace edge (a root-level move).
+    var dest: String?
     /// Destination slot for `tab.move`: the tab's FINAL 1-based position in
     /// `tab list` order, not a drag-and-drop insertion offset.
     var slot: Int?
@@ -117,6 +122,8 @@ struct ControlArgs: Codable, Equatable {
         axis: String? = nil,
         ratio: Double? = nil,
         key: String? = nil,
+        zone: String? = nil,
+        dest: String? = nil,
         slot: Int? = nil
     ) {
         self.project = project
@@ -135,6 +142,8 @@ struct ControlArgs: Codable, Equatable {
         self.axis = axis
         self.ratio = ratio
         self.key = key
+        self.zone = zone
+        self.dest = dest
         self.slot = slot
     }
 }
