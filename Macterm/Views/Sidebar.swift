@@ -6,6 +6,13 @@ private enum SidebarItem: Hashable {
     case tab(projectID: UUID, tabID: UUID)
 }
 
+/// A sidebar row's content region extends past the selection highlight's
+/// trailing edge. A short label never reaches out there, but content that
+/// fills the row — split segments, the merge drop slot, a fading title —
+/// does, and reads as overflowing the highlight. Every row applies this
+/// trailing inset at its root so all of them stop at the same edge.
+private let rowTrailingInset: CGFloat = 10
+
 /// In-app drag payload for a sidebar tab row. Carries the tab's identity plus
 /// its source project so a drop can tell a same-project reorder from a
 /// cross-project move. `TerminalTab` itself is a live reference type (owns
@@ -161,15 +168,20 @@ struct SidebarContent: View {
     }
 
     private func tabRow(tab: TerminalTab, index tabIndex: Int, project: Project) -> some View {
-        MergeableTabRow(
+        SidebarTabRow(
             tab: tab,
             index: tabIndex + 1,
-            project: project,
             onRename: { newName in
                 tab.customTitle = newName.isEmpty ? nil : newName
                 appState.saveWorkspaces()
             }
         )
+        .padding(.trailing, rowTrailingInset)
+        // Stretch to the full row and make every point hit-testable: without
+        // this, the drag grab area hugs the label's intrinsic width instead
+        // of covering the whole row.
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
         .tag(SidebarItem.tab(projectID: project.id, tabID: tab.id))
         // Drag a tab out to another project (or reorder within this one). The
         // payload is just IDs — the live tab is looked up on drop, never
@@ -181,6 +193,7 @@ struct SidebarContent: View {
         SidebarProjectRow(project: project, index: projectIndex + 1) {
             projectStore.rename(id: project.id, to: $0)
         }
+        .padding(.trailing, rowTrailingInset)
         .tag(SidebarItem.project(project.id))
         // Drag the header to reorder projects (replaces the removed `.onMove`).
         .draggable(MovableProject(projectID: project.id))
@@ -401,187 +414,6 @@ struct SidebarContent: View {
     }
 }
 
-// MARK: - Tab merge drop target (#227)
-
-/// What the merge drop hovering over a tab row would do, driving the row's
-/// highlight: land the dragged tab on one side of a fresh split (single-pane
-/// destination — the hovered half of the row picks the side), or append it to
-/// an already-split destination (whole-row highlight).
-private enum TabMergeState: Equatable {
-    case idle
-    /// The drag is this row's own tab — a self-merge is meaningless, so the
-    /// row shows nothing and the drop is cancelled.
-    case rejected
-    case side(SplitPosition)
-    case whole
-}
-
-/// A sidebar tab row that also accepts another tab dropped onto it, merging
-/// the two into a split (#227). Wraps `SidebarTabRow` so each row owns its
-/// hover state; dropping between rows still reorders via the ForEach-level
-/// `dropDestination` in `projectSection`.
-private struct MergeableTabRow: View {
-    let tab: TerminalTab
-    let index: Int
-    let project: Project
-    let onRename: (String) -> Void
-    @Environment(AppState.self)
-    private var appState
-    @State
-    private var mergeState: TabMergeState = .idle
-
-    var body: some View {
-        rowContent
-            // Stretch to the full row and make every point hit-testable:
-            // without this, the drag grab area and the merge drop target hug
-            // the label's intrinsic width instead of covering the whole row.
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .contentShape(Rectangle())
-            .background {
-                // Same shape as SplitLeafView's drop target: `Color.clear` in
-                // a GeometryReader so the delegate knows the row width (the
-                // left/right half of a single-pane row picks the split side).
-                GeometryReader { geo in
-                    Color.clear.onDrop(of: [.mactermTab], delegate: TabMergeDropDelegate(
-                        mergeState: $mergeState,
-                        rowWidth: geo.size.width,
-                        destinationTabID: tab.id,
-                        destinationIsSplit: tab.splitRoot.allPanes().count > 1,
-                        onMerge: { movable, side in
-                            appState.mergeTab(
-                                movable.tabID,
-                                from: movable.sourceProjectID,
-                                intoTab: tab.id,
-                                inProject: project.id,
-                                side: side
-                            )
-                        }
-                    ))
-                }
-            }
-            .overlay {
-                // The append case (already-split destination) keeps a plain
-                // whole-row highlight; the first split previews structurally
-                // via `rowContent` instead.
-                if mergeState == .whole {
-                    RoundedRectangle(cornerRadius: 4)
-                        .fill(MactermTheme.accent.opacity(0.3))
-                        .allowsHitTesting(false)
-                }
-            }
-            .animation(.easeInOut(duration: 0.15), value: mergeState)
-    }
-
-    /// The issue's real-time preview: while a drag hovers a single-pane row,
-    /// the splitee's content slides into one half and a drop slot marks the
-    /// half the splitter tab will take, flipping live as the cursor crosses
-    /// the row's midpoint.
-    @ViewBuilder
-    private var rowContent: some View {
-        switch mergeState {
-        case let .side(position):
-            HStack(spacing: 4) {
-                if position == .first { dropSlot }
-                SidebarTabRow(tab: tab, index: index, onRename: onRename)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                if position == .second { dropSlot }
-            }
-        case .idle,
-             .rejected,
-             .whole:
-            SidebarTabRow(tab: tab, index: index, onRename: onRename)
-        }
-    }
-
-    /// The empty container the dragged tab will land in.
-    private var dropSlot: some View {
-        RoundedRectangle(cornerRadius: 5)
-            .fill(MactermTheme.accent.opacity(0.2))
-            .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(MactermTheme.accent.opacity(0.5)))
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-}
-
-/// Per-row drop delegate for the tab-onto-tab merge. A `DropDelegate` (not
-/// `dropDestination`) because the highlight follows the hover location: on a
-/// single-pane destination the hovered half of the row decides which side of
-/// the split the dragged tab lands on.
-private struct TabMergeDropDelegate: DropDelegate {
-    @Binding var mergeState: TabMergeState
-    let rowWidth: CGFloat
-    let destinationTabID: UUID
-    let destinationIsSplit: Bool
-    let onMerge: @MainActor (MovableTab, SplitPosition) -> Void
-
-    func validateDrop(info: DropInfo) -> Bool {
-        info.hasItemsConforming(to: [.mactermTab])
-    }
-
-    func dropEntered(info: DropInfo) {
-        // A row can't merge with itself. The payload is usually readable
-        // synchronously off the drag pasteboard (in-app drag); when it isn't,
-        // the highlight shows and `AppState.mergeTab`'s guard makes the drop
-        // a no-op.
-        if let movable = MovableTab.fromDragPasteboard(), movable.tabID == destinationTabID {
-            mergeState = .rejected
-            return
-        }
-        mergeState = state(at: info.location)
-    }
-
-    func dropUpdated(info: DropInfo) -> DropProposal? {
-        guard mergeState != .rejected else { return DropProposal(operation: .cancel) }
-        // dropUpdated can fire after performDrop; without this guard it would
-        // re-show the merge highlight on a completed drop (same race the pane
-        // drop delegate guards against).
-        guard mergeState != .idle else { return DropProposal(operation: .forbidden) }
-        mergeState = state(at: info.location)
-        return DropProposal(operation: .move)
-    }
-
-    func dropExited(info _: DropInfo) {
-        mergeState = .idle
-    }
-
-    func performDrop(info: DropInfo) -> Bool {
-        let side = splitSide(at: info.location)
-        let rejected = mergeState == .rejected
-        mergeState = .idle
-        guard !rejected else { return false }
-
-        if let movable = MovableTab.fromDragPasteboard() {
-            guard movable.tabID != destinationTabID else { return false }
-            MainActor.assumeIsolated { onMerge(movable, side) }
-            return true
-        }
-        // Fallback when the Transferable payload wasn't rendered onto the
-        // pasteboard yet: the item provider's async loader.
-        guard let provider = info.itemProviders(for: [.mactermTab]).first else { return false }
-        // Locally-named copy (not a `let onMerge = onMerge` shadow, which
-        // hoists over the whole scope and breaks the capture above) so the
-        // @Sendable loader closure doesn't capture non-Sendable self.
-        let merge = onMerge
-        provider.loadDataRepresentation(forTypeIdentifier: UTType.mactermTab.identifier) { data, _ in
-            guard let data, let movable = try? JSONDecoder().decode(MovableTab.self, from: data) else { return }
-            Task { @MainActor in
-                merge(movable, side)
-            }
-        }
-        return true
-    }
-
-    private func state(at location: CGPoint) -> TabMergeState {
-        destinationIsSplit ? .whole : .side(splitSide(at: location))
-    }
-
-    /// The half of the row the cursor is in — only meaningful for the first
-    /// split (an already-split destination always appends on the right).
-    private func splitSide(at location: CGPoint) -> SplitPosition {
-        guard !destinationIsSplit, rowWidth > 0 else { return .second }
-        return location.x < rowWidth / 2 ? .first : .second
-    }
-}
-
 private struct SidebarProjectRow: View {
     let project: Project
     let index: Int
@@ -608,8 +440,7 @@ private struct SidebarProjectRow: View {
                 .onAppear { focused = true }
         } else {
             HStack(spacing: 4) {
-                Text(project.name)
-                    .lineLimit(1)
+                FadingText(project.name)
                 if project.isRemote {
                     // Remote project (#104): panes live on this host over ssh.
                     Image(systemName: "network")
@@ -688,9 +519,18 @@ private struct SidebarTabRow: View {
                 .onSubmit { commit() }
                 .onExitCommand { cancelRename() }
                 .onAppear { focused = true }
+        } else if tab.customTitle == nil, (2 ... 3).contains(tab.splitRoot.allPanes().count) {
+            // #227: a split tab reads as multiple tabs sharing one row — one
+            // chromeless title segment per pane instead of one tab
+            // concatenating the titles with a pipe. A custom title still
+            // wins: the user named the whole tab. Four or more panes won't
+            // fit legibly, so that row collapses back to a single tab titled
+            // with the pane count (see `sidebarRowTitle`). The segments are
+            // a TITLE variant, not their own labels: the row carries one tab
+            // icon regardless of how it is named.
+            splitSegments
         } else {
-            Text(tab.sidebarRowTitle)
-                .lineLimit(1)
+            FadingText(tab.sidebarRowTitle)
         }
     }
 
@@ -699,45 +539,31 @@ private struct SidebarTabRow: View {
         showAgentIcons ? tab.agentIcon : nil
     }
 
-    /// One tab-like container per pane, sharing the row in equal widths —
-    /// the Arc-style split-tab look from #227. Each container carries its own
-    /// icon (the pane's live agent logo when it has one, else the user's tab
-    /// icon) and the pane's title.
-    private var splitContainers: some View {
-        HStack(spacing: 4) {
-            ForEach(tab.splitRoot.allPanes()) { pane in
-                HStack(spacing: 4) {
-                    let agent = showAgentIcons ? pane.agentIcon : nil
-                    if tabIconSymbol != Preferences.noIcon || agent != nil {
-                        SidebarRowIcon(symbol: tabIconSymbol, index: index, agent: agent)
-                            .foregroundStyle(.secondary)
-                    }
-                    Text(pane.sidebarSegmentTitle)
-                        .lineLimit(1)
-                }
-                .padding(.horizontal, 6)
-                .padding(.vertical, 3)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(RoundedRectangle(cornerRadius: 5).fill(MactermTheme.surface))
+    /// One title segment per pane, sharing the row in equal widths, divided
+    /// by hairlines so adjacent titles don't read as one run-on name.
+    private var splitSegments: some View {
+        HStack(spacing: 10) {
+            ForEach(Array(tab.splitRoot.allPanes().enumerated()), id: \.element.id) { i, pane in
+                if i > 0 { Divider() }
+                FadingText(pane.sidebarSegmentTitle)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
     }
 
     var body: some View {
         Group {
-            if !isRenaming, tab.customTitle == nil, (2 ... 3).contains(tab.splitRoot.allPanes().count) {
-                // #227: a split tab reads as multiple tabs sharing one row —
-                // each pane gets its own tab-like container (icon + title)
-                // instead of one tab concatenating the titles with a pipe. A
-                // custom title still wins: the user named the whole tab. Four
-                // or more panes won't fit legibly, so that row collapses back
-                // to a single tab titled with the pane count (see `rowTitle`).
-                splitContainers
-            } else if tabIconSymbol == Preferences.noIcon {
+            if tabIconSymbol == Preferences.noIcon {
                 Label {
                     titleContent
                 } icon: {
-                    if showTabStatusIndicator {
+                    if showTabStatusIndicator, tab.executionState != .idle || agentIcon != nil {
+                        // Only give the label an icon while the status glyph
+                        // actually draws something (spinner, done dot, agent
+                        // logo). An idle status with "None" renders the
+                        // sentinel as an invisible Image that still reserves
+                        // the icon column, nudging the title right of every
+                        // other icon-less row.
                         TabStatusGlyph(state: tab.executionState, symbol: tabIconSymbol, index: index, agent: agentIcon)
                     } else if let agentIcon {
                         // "None" suppresses the user's icon, not the agent
