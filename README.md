@@ -70,6 +70,12 @@ Full guides live at **[macterm.thdxg.dev/docs](https://macterm.thdxg.dev/docs/)*
 - [Declarative layouts](https://macterm.thdxg.dev/docs/declarative-layouts), [Session persistence](https://macterm.thdxg.dev/docs/session-persistence), and [Remote projects](https://macterm.thdxg.dev/docs/remote-projects)
 - [The `macterm` CLI](https://macterm.thdxg.dev/docs/cli)
 
+### Cookbook
+
+The [**Cookbook**](https://macterm.thdxg.dev/docs/cookbook) collects workflows and recipes from the community — the layouts, keybinds, and scripts people actually run to get more out of Macterm. Three to start with: [one <kbd>⌃hjkl</kbd> chord that moves between nvim's splits *and* Macterm's panes](https://github.com/thdxg/macterm/discussions/217), [driving an interactive program from a script](https://github.com/thdxg/macterm/discussions/218), and [giving a coding agent control of Macterm](https://github.com/thdxg/macterm/discussions/219).
+
+Got a recipe of your own? [Start a Cookbook topic](https://github.com/thdxg/macterm/discussions/new?category=cookbook) — anyone can post, and anyone can borrow.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, build, and PR guidelines.
