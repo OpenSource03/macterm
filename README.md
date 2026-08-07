@@ -5,7 +5,8 @@
 </h1>
 
 <p align="center">
-  A macOS terminal with session persistence, smart multiplexing, and native UI, built on libghostty
+  A macOS terminal with session persistence, smart multiplexing, and native UI. Built on libghostty.
+
 </p>
 
 <p align="center">
