@@ -5,7 +5,7 @@
 </h1>
 
 <p align="center">
-  A native macOS terminal with a vertical project sidebar and persistent multiplexing, built on libghostty
+  A macOS terminal with session persistence, smart multiplexing, and native UI, built on libghostty
 </p>
 
 <p align="center">
