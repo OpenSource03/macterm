@@ -1,23 +1,43 @@
 import AppKit
 import IOSurface
 
+/// Tracks a bounded set of follow-up samples for lifecycle and terminal events.
+struct AdaptiveTerminalSamplingBurst {
+    private(set) var retriesRemaining = 0
+
+    mutating func request(retries: Int) {
+        retriesRemaining = max(retriesRemaining, max(0, retries))
+    }
+
+    mutating func consumeRetry() -> Bool {
+        guard retriesRemaining > 0 else { return false }
+        retriesRemaining -= 1
+        return true
+    }
+
+    mutating func cancel() {
+        retriesRemaining = 0
+    }
+}
+
 /// Samples every visible pane in the active terminal window and publishes its
 /// temporary terminal-app background. A single pane may tint the whole window;
 /// split panes are always isolated to their own bounds. Sampling is event-driven
-/// by render/focus changes, with one short verification sample for inferred
-/// colors; there is no idle polling.
+/// by output, render, and focus changes, with bounded retries for frames that
+/// arrive shortly after those events; there is no idle polling.
 @MainActor
 final class AdaptiveTerminalChrome {
     static let shared = AdaptiveTerminalChrome()
 
     private var stabilizers: [UUID: AdaptiveTerminalBackgroundStabilizer] = [:]
     private var sampleTimer: Timer?
-    private var verificationTimer: Timer?
+    private var retryTimer: Timer?
+    private var samplingBurst = AdaptiveTerminalSamplingBurst()
 
     private init() {}
 
     func preferenceDidEnable() {
-        scheduleSample(delay: 0)
+        requestSamplingBurst(delay: 0, retries: 3)
     }
 
     /// Property observers do not run while `Preferences` initializes, so a
@@ -43,12 +63,20 @@ final class AdaptiveTerminalChrome {
     /// the eligible set when the timer fires, one run-loop turn later.
     func focusDidChange(to _: GhosttyTerminalNSView) {
         guard Preferences.shared.adaptiveTerminalChromeEnabled else { return }
-        scheduleSample(delay: 0)
+        requestSamplingBurst(delay: 0, retries: 2)
     }
 
     func terminalDidRender(_ view: GhosttyTerminalNSView) {
         guard shouldHandleEvent(from: view) else { return }
-        scheduleSample(delay: 0.12)
+        requestSamplingBurst(delay: 0.12, retries: 2)
+    }
+
+    /// The renderer action is not emitted by every GhosttyKit build, but the
+    /// PTY output heartbeat reliably covers TUI startup and redraws. A short
+    /// burst lets Metal publish the finished frame before the final sample.
+    func terminalDidOutput(_ view: GhosttyTerminalNSView) {
+        guard shouldHandleEvent(from: view) else { return }
+        requestSamplingBurst(delay: 0.12, retries: 2)
     }
 
     /// OSC 11 is explicit terminal-native evidence and takes effect
@@ -88,25 +116,25 @@ final class AdaptiveTerminalChrome {
         sampleTimer = timer
     }
 
+    private func requestSamplingBurst(delay: TimeInterval, retries: Int) {
+        samplingBurst.request(retries: retries)
+        scheduleSample(delay: delay)
+    }
+
     private func sampleVisiblePanes() {
         guard Preferences.shared.adaptiveTerminalChromeEnabled else { return }
         let views = monitoredViews()
         pruneState(keeping: views)
+        let shouldContinueBurst = samplingBurst.consumeRetry()
         guard !views.isEmpty else {
-            verificationTimer?.invalidate()
-            verificationTimer = nil
             GhosttyApp.shared.adoptAdaptiveBackgroundColor(nil)
+            updateRetryTimer(isNeeded: shouldContinueBurst)
             return
         }
 
         let needsVerification = views.map(sample).contains(true)
         refreshPresentation(for: views)
-        if needsVerification {
-            scheduleVerification()
-        } else {
-            verificationTimer?.invalidate()
-            verificationTimer = nil
-        }
+        updateRetryTimer(isNeeded: needsVerification || shouldContinueBurst)
     }
 
     /// Returns true when this pane has a first, unconfirmed inferred
@@ -163,16 +191,25 @@ final class AdaptiveTerminalChrome {
             ?? effectiveCandidate(view.sampledDominantBackgroundColor)
     }
 
-    private func scheduleVerification() {
-        guard verificationTimer == nil else { return }
+    private func updateRetryTimer(isNeeded: Bool) {
+        guard isNeeded else {
+            retryTimer?.invalidate()
+            retryTimer = nil
+            return
+        }
+        scheduleRetry()
+    }
+
+    private func scheduleRetry() {
+        guard retryTimer == nil else { return }
         let timer = Timer(timeInterval: 0.25, repeats: false) { [weak self] _ in
             MainActor.assumeIsolated {
-                self?.verificationTimer = nil
+                self?.retryTimer = nil
                 self?.sampleVisiblePanes()
             }
         }
         RunLoop.main.add(timer, forMode: .common)
-        verificationTimer = timer
+        retryTimer = timer
     }
 
     private func monitoredViews() -> [GhosttyTerminalNSView] {
@@ -236,7 +273,8 @@ final class AdaptiveTerminalChrome {
     private func cancelTimers() {
         sampleTimer?.invalidate()
         sampleTimer = nil
-        verificationTimer?.invalidate()
-        verificationTimer = nil
+        retryTimer?.invalidate()
+        retryTimer = nil
+        samplingBurst.cancel()
     }
 }

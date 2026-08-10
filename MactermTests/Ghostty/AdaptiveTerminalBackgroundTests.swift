@@ -72,6 +72,35 @@ struct AdaptiveTerminalBackgroundTests {
     }
 
     @Test
+    func samplingBurstStopsAfterItsRequestedRetries() {
+        var burst = AdaptiveTerminalSamplingBurst()
+
+        burst.request(retries: 2)
+        let firstRetry = burst.consumeRetry()
+        let secondRetry = burst.consumeRetry()
+        let exhausted = burst.consumeRetry()
+
+        #expect(firstRetry)
+        #expect(secondRetry)
+        #expect(!exhausted)
+    }
+
+    @Test
+    func samplingBurstExtendsWithoutAccumulatingForever() {
+        var burst = AdaptiveTerminalSamplingBurst()
+        burst.request(retries: 3)
+        let firstRetry = burst.consumeRetry()
+
+        burst.request(retries: 2)
+
+        #expect(firstRetry)
+        #expect(burst.retriesRemaining == 2)
+        burst.cancel()
+        let retryAfterCancellation = burst.consumeRetry()
+        #expect(!retryAfterCancellation)
+    }
+
+    @Test
     func samplesGhosttyBGRAIOSurface() throws {
         let properties = [
             kIOSurfaceWidth: NSNumber(value: 40),

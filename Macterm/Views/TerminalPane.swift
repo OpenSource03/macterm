@@ -355,7 +355,10 @@ private struct TerminalSurface: NSViewRepresentable {
             guard let pane else { return }
             appState?.setTabTitle(containing: pane.id, projectID: pane.projectID, title: title)
         }
-        view.onOutputActivity = { [weak pane] total in
+        view.onOutputActivity = { [weak pane, weak view] total in
+            if let view {
+                AdaptiveTerminalChrome.shared.terminalDidOutput(view)
+            }
             guard let pane, Preferences.shared.showTabStatusIndicator else { return }
             // The single activity source. Output heartbeats fire from the pty
             // IO path regardless of occlusion, so they also reach background
