@@ -352,13 +352,13 @@ struct PaneTests {
         p.markOutputActivity(totalRows: 10)
 
         await confirmation("quiet output wakes the paused poll") { confirm in
-            var fired = false
+            let fired = LockedBox(false)
             let token = NotificationCenter.default.addObserver(
                 forName: .terminalQuietSettleDeadline,
                 object: p,
                 queue: .main
             ) { _ in
-                fired = true
+                fired.mutate { $0 = true }
                 confirm()
             }
             defer { NotificationCenter.default.removeObserver(token) }
@@ -368,7 +368,7 @@ struct PaneTests {
             // co-scheduled spike on a loaded CI runner can push a 20ms timer
             // well past any fixed margin (cf. #181). The generous ceiling only
             // bounds a genuine failure; a healthy run exits on the first tick.
-            for _ in 0 ..< 200 where !fired {
+            for _ in 0 ..< 200 where !fired.value {
                 try? await Task.sleep(for: .milliseconds(25))
             }
         }

@@ -4,6 +4,40 @@ import os
 
 private let logger = Logger(subsystem: appBundleID, category: "AppState")
 
+/// Thread-safe ownership for block-based notification observers. `AppState`
+/// installs observers on the main actor, while Swift deinitializers are
+/// nonisolated; keeping the non-Sendable tokens behind this lock lets teardown
+/// drain them without unsafe actor annotations on observable state.
+private final class ObserverTokenStore: @unchecked Sendable {
+    private typealias Entry = (center: NotificationCenter, token: NSObjectProtocol)
+
+    private let lock = NSLock()
+    private var entries: [Entry] = []
+
+    func append(center: NotificationCenter, token: NSObjectProtocol) {
+        lock.lock()
+        defer { lock.unlock() }
+        entries.append((center, token))
+    }
+
+    func append(contentsOf newEntries: [(center: NotificationCenter, token: NSObjectProtocol)]) {
+        lock.lock()
+        defer { lock.unlock() }
+        entries.append(contentsOf: newEntries)
+    }
+
+    func removeAllObservers() {
+        lock.lock()
+        let drained = entries
+        entries.removeAll()
+        lock.unlock()
+
+        for entry in drained {
+            entry.center.removeObserver(entry.token)
+        }
+    }
+}
+
 @MainActor @Observable
 final class AppState {
     var activeProjectID: UUID? {
@@ -167,11 +201,8 @@ final class AppState {
     private var pollEventObservers: [Any] = []
 
     /// Every block-based observer token paired with the center it was added to,
-    /// so `deinit` can remove them from the correct center. `nonisolated(unsafe)`
-    /// so the nonisolated deinit can read it — the object is being destroyed, so
-    /// there is no concurrent access. Tokens are `NSObjectProtocol` (what
-    /// `addObserver(forName:…)` returns).
-    nonisolated(unsafe) private var observerTokens: [(center: NotificationCenter, token: NSObjectProtocol)] = []
+    /// so `deinit` can remove them from the correct center.
+    private let observerTokens = ObserverTokenStore()
 
     /// Injectable for tests (`PollCadence.Context` inputs). `NSApp` is nil
     /// while the SwiftUI `App` struct (and thus AppState) is constructed —
@@ -239,7 +270,7 @@ final class AppState {
             MainActor.assumeIsolated { self?.rebalanceAllWorkspacesIfEnabled() }
         }
         autoTileObserver = autoTileToken
-        observerTokens.append((NotificationCenter.default, autoTileToken))
+        observerTokens.append(center: NotificationCenter.default, token: autoTileToken)
         let restored = (Preferences.defaults.stringArray(forKey: recencyKey) ?? [])
             .compactMap { UUID(uuidString: $0) }
         projectRecency = RecencyStack<UUID>(limit: 50, items: restored)
@@ -298,12 +329,9 @@ final class AppState {
         // Production runs one app-lifetime instance, but tests build fresh
         // AppStates — without this, their observers accumulate on the shared
         // centers and dead instances' blocks keep firing into a nil weak self.
-        // Only nonisolated-safe calls here (observerTokens is nonisolated).
         // The poll timer self-cleans: it's non-repeating with a `[weak self]`
         // closure, so a dead instance's timer fires once into nil and stops.
-        for entry in observerTokens {
-            entry.center.removeObserver(entry.token)
-        }
+        observerTokens.removeAllObservers()
     }
 
     // MARK: - Poll scheduling
