@@ -552,6 +552,10 @@ final class Pane: Identifiable {
     private var agentIconPID: pid_t?
 
     let searchState = TerminalSearchState()
+    /// Temporary full-pane fill used when a TUI owns this leaf's background in
+    /// a split. It is presentation-only, never persisted, and intentionally a
+    /// CGColor so the model remains independent of AppKit and SwiftUI.
+    var adaptiveBackgroundColor: CGColor?
 
     /// The OSC 8 link URL under the mouse, for the pane's hover banner
     /// (`GHOSTTY_ACTION_MOUSE_OVER_LINK`). Live UI state only — never
@@ -953,6 +957,7 @@ final class Pane: Identifiable {
         var mergedEnv = env ?? [:]
         mergedEnv[ControlProtocol.sessionEnvVar] = sessionName
         let view = GhosttyTerminalNSView(
+            paneID: id,
             workingDirectory: projectPath,
             sessionName: sessionName,
             command: command,
@@ -1003,6 +1008,9 @@ final class Pane: Identifiable {
         view.onCommandFinished = nil
         view.onProgressStarted = nil
         view.onProgressFinished = nil
+        view.onTerminalRender = nil
+        view.onBackgroundColorChange = nil
+        view.onAdaptiveBackgroundChange = nil
         view.onOutputActivity = nil
         view.onScrollbarUpdate = nil
         view.onScrollWheel = nil

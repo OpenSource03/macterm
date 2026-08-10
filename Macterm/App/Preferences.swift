@@ -278,6 +278,22 @@ final class Preferences {
         }
     }
 
+    /// Match an opaque color painted across most of a terminal surface. A lone
+    /// pane may tint the window; split panes are adapted independently. Off by
+    /// default: the user's Ghostty theme remains the source of truth unless
+    /// they explicitly opt in.
+    var adaptiveTerminalChromeEnabled: Bool {
+        didSet {
+            defaults.set(adaptiveTerminalChromeEnabled, forKey: Keys.adaptiveTerminalChromeEnabled)
+            if adaptiveTerminalChromeEnabled {
+                AdaptiveTerminalChrome.shared.preferenceDidEnable()
+            } else {
+                AdaptiveTerminalChrome.shared.preferenceDidDisable()
+            }
+            notifyWindowAppearanceChanged()
+        }
+    }
+
     /// Hide the window's title bar entirely: the toolbar (sidebar toggle, tab
     /// switcher, update button), the title text, and — a side effect of
     /// SwiftUI removing the window toolbar — the traffic lights. The sidebar
@@ -410,6 +426,7 @@ final class Preferences {
         windowGlassEnabled = defaults.object(forKey: Keys.windowGlassEnabled) as? Bool ?? false
         windowGlassStyle = (defaults.string(forKey: Keys.windowGlassStyle))
             .flatMap(WindowGlassStyle.init(rawValue:)) ?? .regular
+        adaptiveTerminalChromeEnabled = defaults.object(forKey: Keys.adaptiveTerminalChromeEnabled) as? Bool ?? false
         hideTitleBar = defaults.object(forKey: Keys.hideTitleBar) as? Bool ?? false
         userGhosttyConfigPath = defaults.string(forKey: Keys.userGhosttyConfigPath) ?? "~/.config/ghostty/config"
         passthroughPrograms = defaults.string(forKey: Keys.passthroughPrograms) ?? ""
@@ -479,6 +496,7 @@ final class Preferences {
         static let windowBlurRadius = "macterm.window.blurRadius"
         static let windowGlassEnabled = "macterm.window.glassEnabled"
         static let windowGlassStyle = "macterm.window.glassStyle"
+        static let adaptiveTerminalChromeEnabled = "macterm.window.adaptiveTerminalChromeEnabled"
         static let hideTitleBar = "macterm.window.hideTitleBar"
         static let userGhosttyConfigPath = "macterm.ghostty.userConfigPath"
         static let passthroughPrograms = "macterm.hotkey.passthroughPrograms"

@@ -9,6 +9,7 @@ struct TerminalPane: View {
     let onFocus: () -> Void
     let onProcessExit: () -> Void
     let onCommandFinished: () -> Void
+    let onAdaptiveBackgroundChange: (CGColor?) -> Void
     let onSplitRequest: (SplitDirection, SplitPosition) -> Void
     let onZoomRequest: () -> Void
 
@@ -46,6 +47,7 @@ struct TerminalPane: View {
                 onFocus: onFocus,
                 onProcessExit: onProcessExit,
                 onCommandFinished: onCommandFinished,
+                onAdaptiveBackgroundChange: onAdaptiveBackgroundChange,
                 onSplitRequest: onSplitRequest,
                 onZoomRequest: onZoomRequest
             )
@@ -63,6 +65,11 @@ struct TerminalPane: View {
                 if focused, SecureInput.shared.enabled, GhosttyApp.shared.secureInputIndication {
                     SecureInputBadge()
                 }
+            }
+        }
+        .background {
+            if let color = pane.adaptiveBackgroundColor {
+                Color(cgColor: color)
             }
         }
     }
@@ -118,6 +125,7 @@ private struct TerminalSurface: NSViewRepresentable {
     let onFocus: () -> Void
     let onProcessExit: () -> Void
     let onCommandFinished: () -> Void
+    let onAdaptiveBackgroundChange: (CGColor?) -> Void
     let onSplitRequest: (SplitDirection, SplitPosition) -> Void
     let onZoomRequest: () -> Void
 
@@ -179,6 +187,7 @@ private struct TerminalSurface: NSViewRepresentable {
                 view.createSurface()
             }
             if focused {
+                AdaptiveTerminalChrome.shared.focusDidChange(to: view)
                 FocusRestoration.restoreFocus(to: pane.id, finder: { pane }, in: view.window)
             }
         }
@@ -221,6 +230,7 @@ private struct TerminalSurface: NSViewRepresentable {
         context.coordinator.wasFocused = focused
         view.isFocused = focused
         if focused, !wasFocused {
+            AdaptiveTerminalChrome.shared.focusDidChange(to: view)
             view.notifySurfaceFocused()
             FocusRestoration.restoreFocus(to: pane.id, finder: { [pane] in pane }, in: view.window)
         } else if !focused, wasFocused {
@@ -332,6 +342,10 @@ private struct TerminalSurface: NSViewRepresentable {
         view.onLinkHover = { [weak pane] url in
             pane?.hoverURL = url
         }
+        view.onTerminalRender = { [weak view] in
+            guard let view else { return }
+            AdaptiveTerminalChrome.shared.terminalDidRender(view)
+        }
         view.titleProvider = { [weak pane] in pane?.displayTitle }
         view.onPromptTitle = { [weak appState, weak pane] in
             guard let pane else { return }
@@ -341,7 +355,10 @@ private struct TerminalSurface: NSViewRepresentable {
             guard let pane else { return }
             appState?.setTabTitle(containing: pane.id, projectID: pane.projectID, title: title)
         }
-        view.onOutputActivity = { [weak pane] total in
+        view.onOutputActivity = { [weak pane, weak view] total in
+            if let view {
+                AdaptiveTerminalChrome.shared.terminalDidOutput(view)
+            }
             guard let pane, Preferences.shared.showTabStatusIndicator else { return }
             // The single activity source. Output heartbeats fire from the pty
             // IO path regardless of occlusion, so they also reach background
@@ -353,6 +370,14 @@ private struct TerminalSurface: NSViewRepresentable {
             // foreground/progress authority until that raw transition occurs.
             pane.refreshForegroundProcess()
             pane.markOutputActivity(totalRows: total)
+        }
+        view.onBackgroundColorChange = { [weak view] color in
+            guard let view else { return }
+            AdaptiveTerminalChrome.shared.terminalBackgroundDidChange(color, in: view)
+        }
+        view.onAdaptiveBackgroundChange = { color in
+            let resolved = color?.usingColorSpace(.sRGB)?.cgColor
+            onAdaptiveBackgroundChange(resolved)
         }
         view.onCommandFinished = { [weak pane, weak view] exitCode, durationNs in
             guard let pane else { return }

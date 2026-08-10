@@ -104,6 +104,9 @@ struct MainWindow: View {
         .sheet(isPresented: $appState.isNewRemoteProjectSheetPresented) {
             NewRemoteProjectSheet()
         }
+        .onAppear {
+            AdaptiveTerminalChrome.shared.mainWindowDidAppear()
+        }
         .task {
             guard !appState.hasRestoredSelection else { return }
             appState.restoreSelection(projects: projectStore.projects)
@@ -293,6 +296,9 @@ struct WorkspaceView: View {
                 onClosePane: { appState.requestClosePane($0, projectID: project.id) },
                 onCommandFinished: { paneID in
                     appState.acknowledgeFinishedCommandIfActive(paneID: paneID, projectID: project.id)
+                },
+                onAdaptiveBackgroundChange: { paneID, color in
+                    appState.setAdaptiveBackgroundColor(color, paneID: paneID, projectID: project.id)
                 },
                 onToggleZoom: { tab.toggleZoom(paneID: $0) },
                 paneDrop: PaneDropContext(

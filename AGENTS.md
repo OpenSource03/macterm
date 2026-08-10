@@ -254,6 +254,7 @@ Sidebar-style (`NavigationSplitView`), matching the macOS System Settings shape.
 
 ## Known Limitations
 
+- **Adaptive TUI background inference depends on Ghostty's current macOS renderer layout** — explicit OSC 11 color changes use the supported callback path, but painted-cell fallback detection reads the surface currently exposed through Ghostty's layer as a BGRA8 IOSurface. Macterm validates that format and fails closed; if Ghostty changes this private renderer detail, OSC 11 continues to work while painted-cell inference remains disabled until updated.
 - **Quick-terminal sessions are ephemeral** — they die on quit (workspace panes persist via zmx and reattach on relaunch; local sessions don't survive reboot — the zmx daemon dies with the OS; remote sessions do, theirs doesn't).
 - **Remote projects require zmx preinstalled on the host** — auto-detected via PATH (profiles + a fallback dir list); if that fails (network-mounted home, exotic `/bin/sh`, non-POSIX shell config), set the project's `zmxPath` to an absolute path. A missing binary surfaces a `macterm: zmx not found` diagnostic in the pane (not a silent close). No upload/install flow yet.
 - **Remote orphan sessions aren't reaped** — the reaper is local-only by design (a shared host's detached `macterm-*` sessions may belong to another machine); crash leftovers on a remote are the user's to `zmx kill`.

@@ -34,15 +34,6 @@ extension NSView {
 // MARK: - Color helpers (for the inactive-glass tint)
 
 extension NSColor {
-    /// Perceptual luminance in 0...1, computed in sRGB. Returns 0 for colors
-    /// that can't be converted to an RGB space (e.g. pattern colors).
-    var luminance: CGFloat {
-        guard let rgb = usingColorSpace(.sRGB) else { return 0 }
-        return 0.2126 * rgb.redComponent + 0.7152 * rgb.greenComponent + 0.0722 * rgb.blueComponent
-    }
-
-    var isLightColor: Bool { luminance > 0.5 }
-
     /// Returns a copy with its HSB saturation multiplied by `factor` (clamped
     /// to 0...1). Used to make the inactive-window overlay read as a desaturated
     /// version of the terminal background, matching Ghostty.
@@ -184,7 +175,7 @@ final class MactermGlassView: NSView {
     /// A saturation-boosted tint + opacity for the inactive overlay, lifted
     /// from Ghostty's `tintProperties`.
     private func tintProperties(for color: NSColor) -> (color: NSColor, opacity: CGFloat) {
-        let isLight = color.isLightColor
+        let isLight = color.prefersDarkForeground
         let vibrant = color.adjustingSaturation(by: 1.2)
         let overlayOpacity: CGFloat = isLight ? 0.35 : 0.85
         return (vibrant, overlayOpacity)
@@ -213,7 +204,7 @@ enum WindowAppearance {
     static func sync(window: NSWindow) {
         let opacity = Preferences.shared.windowOpacity
         let blurRadius = Preferences.shared.windowBlurRadius
-        let bg = GhosttyApp.shared.backgroundColor
+        let bg = MactermTheme.nsBg
         let isTransparent = opacity < 1.0
 
         // Native fullscreen draws its own opaque grey background; widgets show
@@ -269,7 +260,7 @@ enum WindowAppearance {
         guard glassSupported else { return }
         if #available(macOS 26.0, *) {
             guard let glass = existingGlass(in: window) else { return }
-            glass.updateKeyStatus(window.isKeyWindow, backgroundColor: GhosttyApp.shared.backgroundColor)
+            glass.updateKeyStatus(window.isKeyWindow, backgroundColor: MactermTheme.nsBg)
         }
     }
 

@@ -361,6 +361,13 @@ final class QuickTerminalSplitState {
         tab.focusPane(paneID)
     }
 
+    func setAdaptiveBackgroundColor(_ color: CGColor?, paneID: UUID) {
+        guard let pane = tab.splitRoot.findPane(id: paneID),
+              pane.adaptiveBackgroundColor != color
+        else { return }
+        pane.adaptiveBackgroundColor = color
+    }
+
     func requestClosePane(_ paneID: UUID) {
         let needs = tab.splitRoot.findPane(id: paneID)?.nsView?.needsConfirmQuit() ?? false
         if needs {
@@ -496,6 +503,9 @@ private struct QuickTerminalView: View {
                       let pane = state.tab.splitRoot.findPane(id: paneID)
                 else { return }
                 pane.acknowledgeCommandCompletion()
+            },
+            onAdaptiveBackgroundChange: { paneID, color in
+                state.setAdaptiveBackgroundColor(color, paneID: paneID)
             },
             onToggleZoom: { state.tab.toggleZoom(paneID: $0) },
             paneDrop: PaneDropContext(
