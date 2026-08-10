@@ -6,6 +6,13 @@ private enum SidebarItem: Hashable {
     case tab(projectID: UUID, tabID: UUID)
 }
 
+/// A sidebar row's content region extends past the selection highlight's
+/// trailing edge. A short label never reaches out there, but content that
+/// fills the row — split segments, the merge drop slot, a fading title —
+/// does, and reads as overflowing the highlight. Every row applies this
+/// trailing inset at its root so all of them stop at the same edge.
+private let rowTrailingInset: CGFloat = 10
+
 /// In-app drag payload for a sidebar tab row. Carries the tab's identity plus
 /// its source project so a drop can tell a same-project reorder from a
 /// cross-project move. `TerminalTab` itself is a live reference type (owns
@@ -145,7 +152,7 @@ struct SidebarContent: View {
             set: { if $0 { expandedProjects.insert(project.id) } else { expandedProjects.remove(project.id) } }
         )) {
             ForEach(Array(tabs.enumerated()), id: \.element.id) { tabIndex, tab in
-                tabRow(tab: tab, index: tabIndex, activeTabID: ws?.activeTabID, project: project)
+                tabRow(tab: tab, index: tabIndex, project: project)
             }
             // Single drop mechanism for both cases: SwiftUI reports the
             // insertion `offset` within THIS project's tab list. A drop from
@@ -160,16 +167,21 @@ struct SidebarContent: View {
         }
     }
 
-    private func tabRow(tab: TerminalTab, index tabIndex: Int, activeTabID: UUID?, project: Project) -> some View {
+    private func tabRow(tab: TerminalTab, index tabIndex: Int, project: Project) -> some View {
         SidebarTabRow(
             tab: tab,
             index: tabIndex + 1,
-            isActive: activeTabID == tab.id && appState.activeProjectID == project.id,
             onRename: { newName in
                 tab.customTitle = newName.isEmpty ? nil : newName
                 appState.saveWorkspaces()
             }
         )
+        .padding(.trailing, rowTrailingInset)
+        // Stretch to the full row and make every point hit-testable: without
+        // this, the drag grab area hugs the label's intrinsic width instead
+        // of covering the whole row.
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
         .tag(SidebarItem.tab(projectID: project.id, tabID: tab.id))
         // Drag a tab out to another project (or reorder within this one). The
         // payload is just IDs — the live tab is looked up on drop, never
@@ -181,6 +193,7 @@ struct SidebarContent: View {
         SidebarProjectRow(project: project, index: projectIndex + 1) {
             projectStore.rename(id: project.id, to: $0)
         }
+        .padding(.trailing, rowTrailingInset)
         .tag(SidebarItem.project(project.id))
         // Drag the header to reorder projects (replaces the removed `.onMove`).
         .draggable(MovableProject(projectID: project.id))
@@ -322,6 +335,11 @@ struct SidebarContent: View {
     @ViewBuilder
     private func tabMenu(project: Project, tab: TerminalTab) -> some View {
         Button("Rename Tab") { appState.renamingTabID = tab.id }
+        if tab.splitRoot.allPanes().count > 1 {
+            // #227: explode a split tab — every pane after the first opens in
+            // its own tab, shells intact.
+            Button("Separate Panes") { appState.separateTabPanes(tab.id, projectID: project.id) }
+        }
         let moveTargets = projectStore.projects.filter { $0.id != project.id }
         if !moveTargets.isEmpty {
             Menu("Move to Project") {
@@ -422,8 +440,7 @@ private struct SidebarProjectRow: View {
                 .onAppear { focused = true }
         } else {
             HStack(spacing: 4) {
-                Text(project.name)
-                    .lineLimit(1)
+                FadingText(project.name)
                 if project.isRemote {
                     // Remote project (#104): panes live on this host over ssh.
                     Image(systemName: "network")
@@ -475,7 +492,6 @@ private struct SidebarProjectRow: View {
 private struct SidebarTabRow: View {
     let tab: TerminalTab
     let index: Int
-    let isActive: Bool
     let onRename: (String) -> Void
     @Environment(AppState.self)
     private var appState
@@ -503,9 +519,18 @@ private struct SidebarTabRow: View {
                 .onSubmit { commit() }
                 .onExitCommand { cancelRename() }
                 .onAppear { focused = true }
+        } else if tab.customTitle == nil, (2 ... 3).contains(tab.splitRoot.allPanes().count) {
+            // #227: a split tab reads as multiple tabs sharing one row — one
+            // chromeless title segment per pane instead of one tab
+            // concatenating the titles with a pipe. A custom title still
+            // wins: the user named the whole tab. Four or more panes won't
+            // fit legibly, so that row collapses back to a single tab titled
+            // with the pane count (see `sidebarRowTitle`). The segments are
+            // a TITLE variant, not their own labels: the row carries one tab
+            // icon regardless of how it is named.
+            splitSegments
         } else {
-            Text(tab.sidebarTitle)
-                .lineLimit(1)
+            FadingText(tab.sidebarRowTitle)
         }
     }
 
@@ -514,14 +539,32 @@ private struct SidebarTabRow: View {
         showAgentIcons ? tab.agentIcon : nil
     }
 
+    /// One title segment per pane, sharing the row in equal widths, divided
+    /// by hairlines so adjacent titles don't read as one run-on name.
+    private var splitSegments: some View {
+        HStack(spacing: 10) {
+            ForEach(Array(tab.splitRoot.allPanes().enumerated()), id: \.element.id) { i, pane in
+                if i > 0 { Divider() }
+                FadingText(pane.sidebarSegmentTitle)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+    }
+
     var body: some View {
         Group {
             if tabIconSymbol == Preferences.noIcon {
                 Label {
                     titleContent
                 } icon: {
-                    if showTabStatusIndicator {
-                        TabStatusGlyph(state: displayState, symbol: tabIconSymbol, index: index, agent: agentIcon)
+                    if showTabStatusIndicator, tab.executionState != .idle || agentIcon != nil {
+                        // Only give the label an icon while the status glyph
+                        // actually draws something (spinner, done dot, agent
+                        // logo). An idle status with "None" renders the
+                        // sentinel as an invisible Image that still reserves
+                        // the icon column, nudging the title right of every
+                        // other icon-less row.
+                        TabStatusGlyph(state: tab.executionState, symbol: tabIconSymbol, index: index, agent: agentIcon)
                     } else if let agentIcon {
                         // "None" suppresses the user's icon, not the agent
                         // logo — a live status signal, like the else branch.
@@ -535,7 +578,7 @@ private struct SidebarTabRow: View {
                     titleContent
                 } icon: {
                     if showTabStatusIndicator {
-                        TabStatusGlyph(state: displayState, symbol: tabIconSymbol, index: index, agent: agentIcon)
+                        TabStatusGlyph(state: tab.executionState, symbol: tabIconSymbol, index: index, agent: agentIcon)
                     } else {
                         SidebarRowIcon(symbol: tabIconSymbol, index: index, agent: agentIcon)
                             .foregroundStyle(.secondary)
@@ -563,17 +606,6 @@ private struct SidebarTabRow: View {
         }
         isRenaming = false
         appState.restoreFocusToActivePane()
-    }
-
-    private var displayState: TerminalExecutionState {
-        if tab.executionState == .running { return .running }
-        // The tab the user is already looking at never needs an attention
-        // indicator; a background tab's `done` checkmark is shown until it's
-        // acknowledged. Visiting the tab clears all of its panes via the poll's
-        // `acknowledgeFinishedCommandIfActive` (which acknowledges the whole
-        // active tab, not just the focused pane, so the persisted state matches
-        // what's displayed).
-        return isActive ? .idle : tab.executionState
     }
 
     private func cancelRename() {

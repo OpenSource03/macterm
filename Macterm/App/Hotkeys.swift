@@ -39,6 +39,10 @@ enum HotkeyAction: String, CaseIterable, Identifiable {
     case renameTab = "rename_tab"
     case renameProject = "rename_project"
     case copySessionID = "copy_session_id"
+    case applyLayout = "apply_layout"
+    case saveLayout = "save_layout"
+    case separateAllPanes = "separate_all_panes"
+    case separateCurrentPane = "separate_current_pane"
 
     var id: String { rawValue }
 
@@ -47,6 +51,12 @@ enum HotkeyAction: String, CaseIterable, Identifiable {
     var title: String { appCommand.title }
 
     var defaultsKey: String { "macterm.hotkey.\(rawValue)" }
+
+    /// Per-action opt-in (default off): while a full-screen program owns the
+    /// focused pane's keyboard, hand this binding's chord to the program
+    /// instead of firing the action. Separate key from `defaultsKey` so a
+    /// rebind and a passthrough change don't clobber each other.
+    var passthroughDefaultsKey: String { "macterm.hotkey.\(rawValue).passthrough" }
 
     var defaultShortcut: String {
         switch self {
@@ -80,6 +90,14 @@ enum HotkeyAction: String, CaseIterable, Identifiable {
         case .renameTab: "cmd+r"
         case .renameProject: "none"
         case .copySessionID: "none"
+        // Unbound by default: both rewrite or replace the live pane tree, so a
+        // stray keystroke on a stock binding would be destructive.
+        case .applyLayout: "none"
+        case .saveLayout: "none"
+        // Unbound by default for the same reason: both restructure the live
+        // pane tree (shells survive, but the layout doesn't).
+        case .separateAllPanes: "none"
+        case .separateCurrentPane: "none"
         }
     }
 }
@@ -162,6 +180,15 @@ enum HotkeyRegistry {
     /// base codepoint from a keycode alone (CLI-driven keys have no NSEvent).
     static func baseToken(forKeyCode keyCode: UInt16) -> String? {
         keyCodeToBaseToken[keyCode]
+    }
+
+    /// The hardware key code for a base key token (`"c"` → 8), or nil for a
+    /// token we don't map — the inverse of `baseToken(forKeyCode:)`. Lets code
+    /// that carries its own key codes (`TerminalCommandSubmission`, which stays
+    /// isolation-free and so can't read this `@MainActor` map at runtime) pin
+    /// them to this vocabulary in a test.
+    static func keyCode(forToken token: String) -> UInt16? {
+        keyCodes[token]
     }
 
     private static let modifierOnlyCodes: Set<UInt16> = [54, 55, 56, 57, 58, 59, 60, 61, 62]
@@ -342,11 +369,53 @@ enum HotkeyRegistry {
         }
     }
 
+    @MainActor
     static func setShortcutString(_ shortcut: String, for action: HotkeyAction) {
         Preferences.defaults.set(shortcut, forKey: action.defaultsKey)
         // A rebind is the only thing that changes a parsed shortcut — drop the
         // stale cache entry so the next `matches` re-parses it once.
         shortcutCache.withLock { $0[action] = nil }
+        // Bindings live in raw defaults keys, so SwiftUI can't see this write.
+        // Bump the observable version so views that render a binding (the
+        // shortcut hints in WelcomeView/EmptyProjectView) refresh.
+        Preferences.shared.bumpHotkeyVersion()
+        // The menu bar can't be fixed that way — a SwiftUI `.commands` tree is
+        // built once and never re-evaluated — so patch the live NSMenuItems.
+        // Skipping this leaves a cleared shortcut still firing from the menu,
+        // which beats KeyRouter to the event.
+        HotkeyMenuSync.sync()
+    }
+
+    /// Actions the user flagged to pass through to a running program.
+    ///
+    /// Cached for the same reason `shortcutCache` exists, and it matters more
+    /// here: the passthrough gate runs on EVERY keystroke, ahead of the action
+    /// branches, and matching an action costs an `eventToken` string
+    /// normalization per candidate. Scanning only the flagged actions keeps the
+    /// default configuration — nothing flagged — at one `isEmpty` check instead
+    /// of a second full 32-action scan per typed character. `nil` means "not yet
+    /// built"; an empty array is a real (and typical) answer.
+    private static let passthroughCache = OSAllocatedUnfairLock<[HotkeyAction]?>(initialState: nil)
+
+    static func passthroughActions() -> [HotkeyAction] {
+        passthroughCache.withLock { cache in
+            if let cache { return cache }
+            let flagged = HotkeyAction.allCases.filter {
+                Preferences.defaults.bool(forKey: $0.passthroughDefaultsKey)
+            }
+            cache = flagged
+            return flagged
+        }
+    }
+
+    static func passesThroughToPrograms(for action: HotkeyAction) -> Bool {
+        Preferences.defaults.bool(forKey: action.passthroughDefaultsKey)
+    }
+
+    @MainActor
+    static func setPassesThroughToPrograms(_ enabled: Bool, for action: HotkeyAction) {
+        Preferences.defaults.set(enabled, forKey: action.passthroughDefaultsKey)
+        passthroughCache.withLock { $0 = nil }
     }
 
     static func isValidShortcutString(_ shortcut: String) -> Bool {

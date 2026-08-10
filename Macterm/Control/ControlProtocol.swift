@@ -75,7 +75,9 @@ struct ControlArgs: Codable, Equatable {
     /// (`tab.new`, `pane.split`, `grid`), typed into the live shell for
     /// `pane.run`.
     var run: String?
-    /// Split direction: `right`, `down`, or `auto`.
+    /// Direction, with a per-command vocabulary: `right`/`down`/`auto` for
+    /// `pane.split`, `left`/`down`/`up`/`right` for `pane.focus` (where it
+    /// makes the resolved pane the origin and focuses its neighbour).
     var direction: String?
     /// Skip the busy-confirmation and destructive-plan guards
     /// (`tab.close`, `pane.close`, `layout.apply`).
@@ -94,6 +96,14 @@ struct ControlArgs: Codable, Equatable {
     /// `ctrl+c`, `escape`, `up`, or `ctrl+\` — delivered through libghostty's
     /// key-encoding path, not the text-paste path `run` uses.
     var key: String?
+    /// Drop zone for the debug-only `pane.move`: `left`/`right`/`top`/`bottom`.
+    var zone: String?
+    /// Destination pane selector for `pane.move` (same tab); nil = the
+    /// workspace edge (a root-level move).
+    var dest: String?
+    /// Destination slot for `tab.move`: the tab's FINAL 1-based position in
+    /// `tab list` order, not a drag-and-drop insertion offset.
+    var slot: Int?
 
     init(
         project: String? = nil,
@@ -111,7 +121,10 @@ struct ControlArgs: Codable, Equatable {
         scrollback: Bool? = nil,
         axis: String? = nil,
         ratio: Double? = nil,
-        key: String? = nil
+        key: String? = nil,
+        zone: String? = nil,
+        dest: String? = nil,
+        slot: Int? = nil
     ) {
         self.project = project
         self.tab = tab
@@ -129,6 +142,9 @@ struct ControlArgs: Codable, Equatable {
         self.axis = axis
         self.ratio = ratio
         self.key = key
+        self.zone = zone
+        self.dest = dest
+        self.slot = slot
     }
 }
 
@@ -244,6 +260,11 @@ struct ControlPaneInfo: Codable, Equatable {
     var process: String?
     var cwd: String?
     var focused: Bool
+    /// The tab activity indicator's underlying state: `idle`, `running`, or
+    /// `done` (finished while unfocused — the indicator scripts want to poll
+    /// for). Optional per the additive-field convention above — nil when
+    /// decoded from an older server that predates this field.
+    var state: String?
 }
 
 struct ControlSessionInfo: Codable, Equatable {

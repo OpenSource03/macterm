@@ -223,6 +223,186 @@ struct AppStateTests {
         #expect(state.workspaces[p2.id]?.tabs.count == ws2Before)
     }
 
+    // MARK: - Merge a tab into the workspace's active tab (#227)
+
+    @Test
+    func mergeTab_at_pane_target_splits_in_zone_direction() throws {
+        let state = makeAppState()
+        let p = seedProject(state)
+        let ws = try #require(state.workspaces[p.id])
+        let destTab = try #require(ws.activeTab)
+        let destPane = try #require(destTab.splitRoot.allPanes().first?.id)
+        let sourceTab = ws.createTab(projectPath: p.path)
+        let sourcePane = try #require(sourceTab.splitRoot.allPanes().first?.id)
+        ws.selectTab(destTab.id)
+
+        state.mergeTab(sourceTab.id, from: p.id, at: .pane(destPane, .top), inProject: p.id)
+
+        #expect(ws.tabs.map(\.id) == [destTab.id])
+        // .top means the source lands first in a vertical split.
+        #expect(destTab.splitRoot.allPanes().map(\.id) == [sourcePane, destPane])
+        guard case let .split(branch) = destTab.splitRoot else {
+            Issue.record("expected a split root")
+            return
+        }
+        #expect(branch.direction == .vertical)
+    }
+
+    @Test
+    func mergeTab_at_rootEdge_equalizes_to_thirds() throws {
+        let state = makeAppState()
+        let p = seedProject(state)
+        let ws = try #require(state.workspaces[p.id])
+        let destTab = try #require(ws.activeTab)
+        state.splitPane(direction: .horizontal, projectID: p.id)
+        let sourceTab = ws.createTab(projectPath: p.path)
+        ws.selectTab(destTab.id)
+
+        state.mergeTab(sourceTab.id, from: p.id, at: .rootEdge(.left), inProject: p.id)
+
+        // Side-by-side-by-side: every column takes an even third.
+        let frames = destTab.splitRoot.paneFrames()
+        #expect(frames.count == 3)
+        for frame in frames.values {
+            #expect(abs(frame.width - 1.0 / 3.0) < 0.001)
+        }
+    }
+
+    @Test
+    func mergeTab_when_active_tab_is_source_is_noop() throws {
+        let state = makeAppState()
+        let p = seedProject(state)
+        let ws = try #require(state.workspaces[p.id])
+        let tab = try #require(ws.activeTab)
+        state.mergeTab(tab.id, from: p.id, at: .rootEdge(.bottom), inProject: p.id)
+        #expect(ws.tabs.count == 1)
+        #expect(tab.splitRoot.allPanes().count == 1)
+    }
+
+    // MARK: - Separate panes (#227)
+
+    @Test
+    func separateTabPanes_gives_each_pane_its_own_tab() throws {
+        let state = makeAppState()
+        let p = seedProject(state)
+        let ws = try #require(state.workspaces[p.id])
+        let tab = try #require(ws.activeTab)
+        state.splitPane(direction: .horizontal, projectID: p.id)
+        state.splitPane(direction: .vertical, projectID: p.id)
+        let panes = tab.splitRoot.allPanes().map(\.id)
+        #expect(panes.count == 3)
+
+        state.separateTabPanes(tab.id, projectID: p.id)
+
+        // One tab per pane, inserted right after the source in tree order;
+        // the source keeps the first pane and stays selected.
+        #expect(ws.tabs.count == 3)
+        #expect(ws.tabs.first?.id == tab.id)
+        #expect(tab.splitRoot.allPanes().map(\.id) == [panes[0]])
+        #expect(tab.focusedPaneID == panes[0])
+        #expect(ws.tabs.map { $0.splitRoot.allPanes().map(\.id) } == panes.map { [$0] })
+        #expect(ws.activeTabID == tab.id)
+    }
+
+    @Test
+    func separateTabPanes_single_pane_is_noop() throws {
+        let state = makeAppState()
+        let p = seedProject(state)
+        let ws = try #require(state.workspaces[p.id])
+        let tab = try #require(ws.activeTab)
+        state.separateTabPanes(tab.id, projectID: p.id)
+        #expect(ws.tabs.count == 1)
+    }
+
+    // MARK: - Separate one pane into its own tab (Separate Current Pane)
+
+    @Test
+    func separatePane_splits_the_pane_into_its_own_tab() throws {
+        let state = makeAppState()
+        let p = seedProject(state)
+        let ws = try #require(state.workspaces[p.id])
+        let tab = try #require(ws.activeTab)
+        let original = try #require(tab.focusedPaneID)
+        state.splitPane(direction: .horizontal, projectID: p.id)
+        let dragged = try #require(tab.focusedPaneID)
+        tab.zoomedPaneID = dragged
+
+        state.separatePane(dragged, toProject: p.id, destPath: p.path)
+
+        // The source tab keeps its remaining pane, exits the stale zoom, and
+        // repairs focus; the dragged Pane object lives on in the new tab.
+        #expect(tab.splitRoot.allPanes().map(\.id) == [original])
+        #expect(tab.zoomedPaneID == nil)
+        #expect(tab.focusedPaneID == original)
+        #expect(ws.tabs.count == 2)
+        let newTab = try #require(ws.tabs.last)
+        #expect(newTab.splitRoot.allPanes().map(\.id) == [dragged])
+        #expect(newTab.focusedPaneID == dragged)
+        #expect(ws.activeTabID == newTab.id)
+    }
+
+    @Test
+    func separatePane_at_index_lands_at_that_slot() throws {
+        let state = makeAppState()
+        let p = seedProject(state)
+        let ws = try #require(state.workspaces[p.id])
+        let tab = try #require(ws.activeTab)
+        state.splitPane(direction: .horizontal, projectID: p.id)
+        let dragged = try #require(tab.focusedPaneID)
+
+        state.separatePane(dragged, toProject: p.id, destPath: p.path, at: 0)
+
+        #expect(ws.tabs.count == 2)
+        #expect(ws.tabs.first?.splitRoot.allPanes().map(\.id) == [dragged])
+        #expect(ws.tabs.last?.id == tab.id)
+    }
+
+    @Test
+    func separatePane_across_projects_rebinds_and_activates_destination() throws {
+        let state = makeAppState()
+        let p1 = seedProject(state, name: "p1", path: "/tmp1")
+        let p2 = seedProject(state, name: "p2", path: "/tmp2")
+        let ws1 = try #require(state.workspaces[p1.id])
+        let ws2 = try #require(state.workspaces[p2.id])
+        state.selectProject(p1)
+        state.splitPane(direction: .horizontal, projectID: p1.id)
+        let sourceTab = try #require(ws1.activeTab)
+        let dragged = try #require(sourceTab.focusedPaneID)
+        let ws2TabsBefore = ws2.tabs.count
+
+        state.separatePane(dragged, toProject: p2.id, destPath: p2.path)
+
+        #expect(sourceTab.splitRoot.allPanes().count == 1)
+        #expect(ws2.tabs.count == ws2TabsBefore + 1)
+        let newTab = try #require(ws2.tabs.last)
+        #expect(newTab.splitRoot.allPanes().map(\.id) == [dragged])
+        // Routing identity follows the pane, mirroring moveTab's rebind.
+        #expect(newTab.splitRoot.allPanes().allSatisfy { $0.projectID == p2.id })
+        #expect(state.activeProjectID == p2.id)
+        #expect(ws2.activeTabID == newTab.id)
+    }
+
+    @Test
+    func separatePane_only_pane_of_its_tab_is_noop() throws {
+        let state = makeAppState()
+        let p = seedProject(state)
+        let ws = try #require(state.workspaces[p.id])
+        let tab = try #require(ws.activeTab)
+        let onlyPane = try #require(tab.focusedPaneID)
+        state.separatePane(onlyPane, toProject: p.id, destPath: p.path)
+        #expect(ws.tabs.count == 1)
+        #expect(tab.splitRoot.allPanes().map(\.id) == [onlyPane])
+    }
+
+    @Test
+    func separatePane_unknown_pane_is_noop() throws {
+        let state = makeAppState()
+        let p = seedProject(state)
+        let ws = try #require(state.workspaces[p.id])
+        state.separatePane(UUID(), toProject: p.id, destPath: p.path)
+        #expect(ws.tabs.count == 1)
+    }
+
     // MARK: - Focus navigation
 
     @Test
@@ -315,6 +495,27 @@ struct AppStateTests {
         // p2 is active; remove p1.
         state.removeProject(p1.id)
         #expect(state.activeProjectID == p2.id)
+    }
+
+    @Test
+    func two_projects_for_the_same_directory_get_independent_workspaces_and_sessions() throws {
+        // Removing the one-project-per-directory constraint: distinct projects
+        // may share a path yet keep wholly separate workspaces (keyed on
+        // Project.id) and non-colliding zmx sessions (per-pane hex entropy).
+        let state = makeAppState()
+        let a = seedProject(state, name: "a", path: "/tmp/shared")
+        let b = seedProject(state, name: "b", path: "/tmp/shared")
+
+        #expect(a.id != b.id)
+        let wsA = try #require(state.workspaces[a.id])
+        let wsB = try #require(state.workspaces[b.id])
+        #expect(wsA !== wsB)
+
+        // Session names differ despite the shared path: the slug matches but
+        // each pane's hex suffix comes from its own UUID.
+        let nameA = try #require(wsA.activeTab?.splitRoot.allPanes().first?.sessionName)
+        let nameB = try #require(wsB.activeTab?.splitRoot.allPanes().first?.sessionName)
+        #expect(nameA != nameB)
     }
 
     // MARK: - Bulk removal (sidebar multi-select)
@@ -529,6 +730,50 @@ struct AppStateTests {
     }
 
     @Test
+    func renameTabContaining_targets_the_panes_tab() async throws {
+        let state = makeAppState()
+        let p = seedProject(state)
+        let tab = try #require(state.workspaces[p.id]?.activeTab)
+        let paneID = try #require(tab.splitRoot.allPanes().first?.id)
+        state.sidebarVisible = false
+
+        state.renameTab(containing: paneID, projectID: p.id)
+
+        #expect(state.sidebarVisible)
+        // The rename target lands a runloop tick later (the sidebar row's
+        // TextField must exist before it's asked to edit) — poll with sleeps.
+        for _ in 0 ..< 100 where state.renamingTabID == nil {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        #expect(state.renamingTabID == tab.id)
+    }
+
+    @Test
+    func renameTabContaining_unknown_pane_is_noop() {
+        let state = makeAppState()
+        let p = seedProject(state)
+        state.sidebarVisible = false
+        state.renameTab(containing: UUID(), projectID: p.id)
+        #expect(!state.sidebarVisible)
+    }
+
+    @Test
+    func setTabTitleContaining_sets_and_clears_customTitle() throws {
+        let state = makeAppState()
+        let p = seedProject(state)
+        let tab = try #require(state.workspaces[p.id]?.activeTab)
+        let paneID = try #require(tab.splitRoot.allPanes().first?.id)
+
+        state.setTabTitle(containing: paneID, projectID: p.id, title: "deploy")
+        #expect(tab.customTitle == "deploy")
+
+        // Empty/nil restores the automatic title, same contract as the
+        // ghostty keybind.
+        state.setTabTitle(containing: paneID, projectID: p.id, title: nil)
+        #expect(tab.customTitle == nil)
+    }
+
+    @Test
     func renamingProjectID_defaults_to_nil() {
         let state = makeAppState()
         #expect(state.renamingProjectID == nil)
@@ -595,13 +840,6 @@ struct AppStateTests {
         try? yaml.write(to: store.directoryURL.appendingPathComponent(filename), atomically: true, encoding: .utf8)
     }
 
-    /// Write a legacy in-repo `.macterm/layout.yaml` (deprecated seed path).
-    private func writeLegacyLayout(_ yaml: String, at root: String) {
-        let url = URL(fileURLWithPath: root).appendingPathComponent(".macterm/layout.yaml")
-        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? yaml.write(to: url, atomically: true, encoding: .utf8)
-    }
-
     @Test
     func selecting_project_with_matching_project_file_auto_applies_on_first_open() throws {
         let files = makeProjectFileStore()
@@ -635,59 +873,24 @@ struct AppStateTests {
     }
 
     @Test
-    func first_open_imports_legacy_layout_into_central_store_and_applies() throws {
-        // Deprecated seed path (#114): no central file + parseable in-repo
-        // `.macterm/layout.yaml` → imported, then applied from the central
-        // store. Remove alongside the legacy path next release.
+    func first_open_without_a_project_file_uses_the_default_workspace() throws {
+        // No central file declares this path, so first open is a plain
+        // single-pane workspace — nothing to seed it from now that the
+        // in-repo `.macterm/layout.yaml` path is gone.
         let files = makeProjectFileStore()
         let state = makeAppState(projectFiles: files)
         let dir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("macterm-legacy-\(UUID().uuidString)")
+            .appendingPathComponent("macterm-nofile-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
-        writeLegacyLayout("""
-        tabs:
-          - name: "Dev"
-            split:
-              direction: horizontal
-              first:  { run: "npm run dev" }
-              second: {}
-        """, at: dir.path)
 
-        let project = Project(name: "Legacy Proj", path: dir.path, sortOrder: 0)
+        let project = Project(name: "No File", path: dir.path, sortOrder: 0)
         state.selectProject(project)
 
-        // Applied…
-        let ws = try #require(state.workspaces[project.id])
-        #expect(ws.tabs.count == 1)
-        #expect(ws.tabs[0].splitRoot.allPanes().count == 2)
-        // …and imported: the central file now declares the project's path,
-        // named by the project-name slug, with the tabs carried over.
-        let imported = try #require(try files.loadFull(forProjectPath: dir.path))
-        #expect(imported.name == "Legacy Proj")
-        #expect(imported.tabs?.count == 1)
-        #expect(files.find(forProjectPath: dir.path)?.url.lastPathComponent == "legacy_proj.yaml")
-        // The in-repo file is left untouched (it's a seed, never deleted).
-        #expect(LayoutFile.exists(atProjectRoot: dir.path))
-    }
-
-    @Test
-    func first_open_with_unparseable_legacy_layout_surfaces_error_and_imports_nothing() throws {
-        let files = makeProjectFileStore()
-        let state = makeAppState(projectFiles: files)
-        let dir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("macterm-legacybad-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
-        writeLegacyLayout("tabs:\n  - split: { direction: horizontal, first: {} }\n", at: dir.path)
-
-        let project = Project(name: "bad", path: dir.path, sortOrder: 0)
-        state.selectProject(project)
-
-        // Error dialog staged, nothing imported, default workspace created.
-        #expect(state.pendingLayoutError?.verb == "import")
-        #expect(files.find(forProjectPath: dir.path) == nil)
+        #expect(state.pendingLayoutError == nil)
         #expect(state.workspaces[project.id]?.tabs[0].splitRoot.allPanes().count == 1)
+        // Nothing is written on open — files appear only on explicit Save Layout.
+        #expect(files.find(forProjectPath: dir.path) == nil)
     }
 
     @Test
@@ -713,82 +916,166 @@ struct AppStateTests {
     }
 
     @Test
-    func apply_layout_imports_legacy_for_already_open_project() throws {
-        // The migration path for existing projects (#114): a restored
-        // snapshot (here, a live workspace) suppresses the first-open import,
-        // so an explicit Apply Layout must import the committed legacy file
-        // itself — otherwise it stays unreachable for the whole deprecation
-        // window. Remove alongside the legacy path next release.
+    func apply_layout_without_a_project_file_surfaces_an_error() throws {
+        // An already-open project with no central declaration: Apply Layout has
+        // nothing to read and says so, rather than silently doing nothing.
         let files = makeProjectFileStore()
         let state = makeAppState(projectFiles: files)
         let dir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("macterm-legacylive-\(UUID().uuidString)")
+            .appendingPathComponent("macterm-applynofile-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
 
         let project = Project(name: "Existing", path: dir.path, sortOrder: 0)
         state.selectProject(project)
         #expect(state.workspaces[project.id]?.tabs[0].splitRoot.allPanes().count == 1)
-        writeLegacyLayout("""
-        tabs:
-          - name: "Dev"
-            split:
-              direction: horizontal
-              first:  { run: "npm run dev" }
-              second: {}
-        """, at: dir.path)
 
         state.applyLayoutPresentingError(project)
 
+        #expect(state.pendingLayoutError?.verb == "apply")
+        #expect(files.find(forProjectPath: dir.path) == nil)
+        // The live workspace is untouched by a failed apply.
+        #expect(state.workspaces[project.id]?.tabs[0].splitRoot.allPanes().count == 1)
+    }
+
+    // MARK: - Action toasts
+
+    @Test
+    func save_layout_toasts_with_the_full_path_it_wrote() throws {
+        let files = makeProjectFileStore()
+        let state = makeAppState(projectFiles: files)
+        let (project, _) = seedProjectWithDir(state) // name "proj" → proj.yaml
+
+        state.saveLayoutPresentingError(project)
+
         #expect(state.pendingLayoutError == nil)
-        // Imported into the central store, named by the project-name slug…
-        #expect(files.find(forProjectPath: dir.path)?.url.lastPathComponent == "existing.yaml")
-        // …and applied to the live workspace (non-destructive: the idle pane
-        // is reused positionally, the command pane spawns).
-        let ws = try #require(state.workspaces[project.id])
-        #expect(ws.tabs.count == 1)
-        #expect(ws.tabs[0].customTitle == "Dev")
-        #expect(ws.tabs[0].splitRoot.allPanes().count == 2)
+        #expect(state.activeToast?.title == "Layout saved")
+        // The full path, not just the filename: the projects directory isn't
+        // somewhere the user necessarily has in mind, so the subtitle has to
+        // say where to go look — while still naming *which* file a save with
+        // several same-path candidates landed in.
+        let subtitle = try #require(state.activeToast?.subtitle)
+        #expect(subtitle.hasSuffix("proj.yaml"))
+        #expect(subtitle.contains("/"))
+        #expect(subtitle == ProjectPath.homeContracted(files.directoryURL.appendingPathComponent("proj.yaml").path))
     }
 
     @Test
-    func apply_layout_with_unparseable_legacy_surfaces_import_error() throws {
+    func save_layout_toast_contracts_the_home_prefix() {
+        // A path under home renders as `~/…` — readable, and it keeps the
+        // username out of screenshots. `homeContracted` is the same helper the
+        // written file's own `path:` uses, so the two can't drift.
+        let home = ProjectPath.currentHome
+        #expect(ProjectPath.homeContracted("\(home)/.config/macterm/projects/a.yaml")
+            == "~/.config/macterm/projects/a.yaml")
+        // Outside home, it passes through rather than mangling the path.
+        #expect(ProjectPath.homeContracted("/etc/macterm/a.yaml") == "/etc/macterm/a.yaml")
+    }
+
+    @Test
+    func save_layout_conflict_raises_a_dialog_instead_of_a_toast() {
+        // A stray file declaring the same path makes the save a *notice*, not a
+        // clean success. Toasting "Layout saved" alongside would undercut the
+        // dialog that explains what's wrong.
+        let files = makeProjectFileStore()
+        let state = makeAppState(projectFiles: files)
+        let (project, root) = seedProjectWithDir(state)
+        // Bare `path:` with no `name:` — files no project's slug owns, which is
+        // what makes them strays rather than a sibling's legitimate file. Two,
+        // mirroring `save_layout_lists_ignored_duplicates_when_the_save_wins`:
+        // the save claims one and reports the rest.
+        writeProjectFile("path: \(root)", in: files, filename: "aaa.yaml")
+        writeProjectFile("path: \(root)", in: files, filename: "zzz.yaml")
+
+        state.saveLayoutPresentingError(project)
+
+        #expect(state.pendingLayoutError != nil)
+        #expect(state.activeToast == nil)
+    }
+
+    @Test
+    func apply_layout_toasts_only_when_user_invoked() throws {
         let files = makeProjectFileStore()
         let state = makeAppState(projectFiles: files)
         let dir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("macterm-legacylivebad-\(UUID().uuidString)")
+            .appendingPathComponent("macterm-toastapply-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
-
-        let project = Project(name: "Existing", path: dir.path, sortOrder: 0)
+        writeProjectFile("path: \(dir.path)\ntabs:\n  - name: \"Dev\"\n", in: files)
+        let project = Project(name: "toast", path: dir.path, sortOrder: 0)
         state.selectProject(project)
-        writeLegacyLayout("tabs:\n  - split: { direction: horizontal, first: {} }\n", at: dir.path)
 
-        state.applyLayoutPresentingError(project)
+        // The first-open seed fires unbidden — it must stay silent.
+        #expect(state.activeToast == nil)
 
-        #expect(state.pendingLayoutError?.verb == "import")
-        #expect(files.find(forProjectPath: dir.path) == nil)
+        state.applyLayoutPresentingError(project, confirming: true)
+
+        #expect(state.pendingLayoutError == nil)
+        #expect(state.activeToast?.title == "Layout applied")
+    }
+
+    @Test
+    func apply_layout_failure_raises_a_dialog_instead_of_a_toast() {
+        // No file declares this project's path — the command surfaces the
+        // error, and a success toast would flatly contradict it.
+        let state = makeAppState(projectFiles: makeProjectFileStore())
+        let (project, _) = seedProjectWithDir(state)
+
+        state.applyLayoutPresentingError(project, confirming: true)
+
+        #expect(state.pendingLayoutError != nil)
+        #expect(state.activeToast == nil)
+    }
+
+    @Test
+    func dismissing_a_superseded_toast_leaves_the_newer_one_up() {
+        // The auto-dismiss task is keyed by toast id. A stale one firing after
+        // a second toast replaced the first must not cut the new one short.
+        let state = makeAppState()
+        state.presentToast("First")
+        let first = try? #require(state.activeToast?.id)
+        state.presentToast("Second")
+
+        if let first { state.dismissToast(first) }
+
+        #expect(state.activeToast?.title == "Second")
+    }
+
+    @Test
+    func dismissing_the_current_toast_clears_it() {
+        let state = makeAppState()
+        state.presentToast("Only")
+        let id = state.activeToast?.id
+
+        if let id { state.dismissToast(id) }
+
+        #expect(state.activeToast == nil)
+    }
+
+    @Test
+    func a_subtitled_toast_stays_up_longer() {
+        // Two lines need more reading time than one.
+        #expect(Toast(title: "Bare").duration < Toast(title: "Detailed", subtitle: "more").duration)
     }
 
     // MARK: - saveLayout duplicate conflicts
 
     @Test
-    func save_layout_warns_when_a_duplicate_file_shadows_the_save() throws {
+    func save_layout_does_not_flag_a_sibling_projects_file() {
+        // A distinct-name sibling on the same directory owns its own file.
+        // Saving this project must neither report that file as a stray nor
+        // realign-delete it.
         let files = makeProjectFileStore()
         let state = makeAppState(projectFiles: files)
-        let (project, root) = seedProjectWithDir(state)
-        // Two hand-authored duplicates. The save replaces the first (bound)
-        // one, but "bbb.yaml" survives and sorts before "proj.yaml" — so it
-        // shadows what was just saved.
-        writeProjectFile("path: \(root)", in: files, filename: "aaa.yaml")
-        writeProjectFile("path: \(root)", in: files, filename: "bbb.yaml")
+        let (project, root) = seedProjectWithDir(state) // name "proj" → proj.yaml
+        let sibling = Project(name: "other", path: root, sortOrder: 1)
+        writeProjectFile("name: other\npath: \(root)", in: files, filename: "other.yaml")
 
-        state.saveLayoutPresentingError(project)
+        state.saveLayoutPresentingError(project, siblingProjects: [project, sibling])
 
-        let notice = try #require(state.pendingLayoutError)
-        #expect(notice.title == "Layout saved with a conflict")
-        #expect(notice.message.contains("bbb.yaml"))
-        #expect(notice.message.contains("takes precedence"))
+        #expect(state.pendingLayoutError == nil)
+        #expect(files.find(forProjectPath: root, preferredSlug: "other")?.url.lastPathComponent == "other.yaml")
+        #expect(files.find(forProjectPath: root, preferredSlug: "proj")?.url.lastPathComponent == "proj.yaml")
     }
 
     @Test
@@ -814,6 +1101,66 @@ struct AppStateTests {
         let (project, _) = seedProjectWithDir(state)
         state.saveLayoutPresentingError(project)
         #expect(state.pendingLayoutError == nil)
+    }
+
+    @Test
+    func save_layout_warns_when_a_same_named_project_shares_the_directory() throws {
+        // Two projects for one directory with the same name → same filename
+        // slug → the same layout file. The save silently overwrote the other's
+        // layout, so it must warn.
+        let state = makeAppState()
+        let (project, root) = seedProjectWithDir(state) // name "proj"
+        let sibling = Project(name: "proj", path: root, sortOrder: 1)
+
+        state.saveLayoutPresentingError(project, siblingProjects: [project, sibling])
+
+        let notice = try #require(state.pendingLayoutError)
+        #expect(notice.title == "Layout file shared with another project")
+        #expect(notice.message.contains("proj"))
+    }
+
+    @Test
+    func save_layout_stays_silent_when_same_dir_projects_have_distinct_names() {
+        // Same directory but different names → distinct slug files
+        // (`proj.yaml` / `other.yaml`), so there's no shared-file overwrite.
+        let state = makeAppState()
+        let (project, root) = seedProjectWithDir(state) // name "proj"
+        let sibling = Project(name: "other", path: root, sortOrder: 1)
+
+        state.saveLayoutPresentingError(project, siblingProjects: [project, sibling])
+
+        #expect(state.pendingLayoutError == nil)
+    }
+
+    @Test
+    func each_same_directory_project_saves_and_loads_its_own_layout() throws {
+        // The core guarantee of per-project layout identity: two distinct-name
+        // projects on one directory each save to and load from their own file —
+        // saving one never clobbers the other's, and neither resolves the
+        // other's on load (path alone can't tell them apart; the slug does).
+        let files = makeProjectFileStore()
+        let state = makeAppState(projectFiles: files)
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("macterm-shared-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let alpha = Project(name: "alpha", path: dir.path, sortOrder: 0)
+        let bravo = Project(name: "bravo", path: dir.path, sortOrder: 1)
+        state.selectProject(alpha)
+        state.selectProject(bravo)
+        let siblings = [alpha, bravo]
+
+        state.saveLayoutPresentingError(alpha, siblingProjects: siblings)
+        state.saveLayoutPresentingError(bravo, siblingProjects: siblings)
+
+        #expect(state.pendingLayoutError == nil)
+        // Both files coexist — saving bravo didn't realign-delete alpha's.
+        #expect(files.find(forProjectPath: dir.path, preferredSlug: "alpha")?.url.lastPathComponent == "alpha.yaml")
+        #expect(files.find(forProjectPath: dir.path, preferredSlug: "bravo")?.url.lastPathComponent == "bravo.yaml")
+        // Each resolves the file it wrote, identified by the stored name.
+        #expect(try files.loadFull(forProjectPath: dir.path, preferredSlug: "alpha")?.name == "alpha")
+        #expect(try files.loadFull(forProjectPath: dir.path, preferredSlug: "bravo")?.name == "bravo")
     }
 
     @Test
@@ -1021,18 +1368,18 @@ struct AppStateTests {
         #expect(AppState.panesToWarm(in: ws).isEmpty)
     }
 
-    // MARK: - Occlusion-aware quiet-settle
+    // MARK: - Quiet-settle
 
-    // These drive `AppState.settleIfVisible` directly with an injected
-    // occlusion closure, rather than the full `refreshAllForegroundProcesses`
-    // tick. The tick also re-reads each pane's real foreground process (nil in
-    // a unit test with no live surface, which clears the run source) and is
-    // gated on the `Preferences.shared.showTabStatusIndicator` singleton —
-    // mutating that global races the parallel test runner. Testing the guard
-    // in isolation is both deterministic and a truer unit of what PR adds.
+    // The poll calls `pane.settleTerminalActivityIfQuiet()` directly (no
+    // occlusion special-casing): the OUTPUT_ACTIVITY heartbeat that sources
+    // activity is occlusion-independent, so a quiet pane settles the same
+    // whether or not it is on screen. These drive the settle in isolation —
+    // deterministic (no live surface, no `Preferences` global) and a truer
+    // unit than the full `refreshAllForegroundProcesses` tick, which re-reads
+    // each pane's real foreground process (nil under test, clearing the run
+    // source).
 
-    /// A pane whose activity went quiet long ago (past the 3s settle window),
-    /// so a visible settle resolves it to `.done` and an occluded one holds.
+    /// A pane whose activity went quiet long ago (past the 3s settle window).
     private func quietRunningPane() -> Pane {
         let pane = Pane(projectPath: "/tmp", projectID: UUID())
         pane.recordUserInteraction()
@@ -1042,46 +1389,22 @@ struct AppStateTests {
     }
 
     @Test
-    func occluded_pane_does_not_quiet_settle() {
-        let state = makeAppState()
+    func quiet_activity_run_settles_to_done() {
         let pane = quietRunningPane()
-        state.paneIsOccluded = { _ in true }
-
-        state.settleIfVisible(pane)
-        // 10s of silence, but the renderer was parked — silence proves
-        // nothing, so the pane must stay running.
-        #expect(pane.executionState == .running)
-    }
-
-    @Test
-    func visible_pane_still_quiet_settles() {
-        let state = makeAppState()
-        let pane = quietRunningPane()
-        state.paneIsOccluded = { _ in false }
-
-        state.settleIfVisible(pane)
+        // 10s of silence is past the window — occluded or not, it's done.
+        pane.settleTerminalActivityIfQuiet()
         #expect(pane.executionState == .done)
     }
 
     @Test
-    func deoccluded_pane_gets_fresh_quiet_window_before_settling() {
-        let state = makeAppState()
-        let pane = quietRunningPane()
-
-        // Occluded: no settle, and the pane is marked as having been occluded.
-        state.paneIsOccluded = { _ in true }
-        state.settleIfVisible(pane)
+    func activity_run_holds_until_the_quiet_window_elapses() {
+        let pane = Pane(projectPath: "/tmp", projectID: UUID())
+        pane.recordUserInteraction()
+        let start = Date()
+        pane.markTerminalActivity(at: start)
+        pane.settleTerminalActivityIfQuiet(now: start.addingTimeInterval(2), quietInterval: 3)
         #expect(pane.executionState == .running)
-
-        // Now visible. The stale 10s-old activity timestamp must not settle it
-        // instantly — a false `.done` would stick, since activity can never
-        // revive a done pane. The window restarts instead.
-        state.paneIsOccluded = { _ in false }
-        state.settleIfVisible(pane)
-        #expect(pane.executionState == .running)
-
-        // With genuine quiet now elapsing from the reset window, it settles.
-        pane.settleTerminalActivityIfQuiet(now: Date().addingTimeInterval(4))
+        pane.settleTerminalActivityIfQuiet(now: start.addingTimeInterval(3), quietInterval: 3)
         #expect(pane.executionState == .done)
     }
 

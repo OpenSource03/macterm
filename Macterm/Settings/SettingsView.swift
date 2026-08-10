@@ -2,36 +2,390 @@ import AppKit
 import Carbon
 import SwiftUI
 
-struct SettingsView: View {
-    var body: some View {
-        TabView {
-            GeneralSettings()
-                .tabItem { Label("General", systemImage: "gearshape") }
-            AppearanceSettings()
-                .tabItem { Label("Appearance", systemImage: "paintpalette") }
-            QuickTerminalSettings()
-                .tabItem {
-                    Label("Quick Terminal", systemImage: "rectangle.bottomthird.inset.filled")
-                }
-            KeymapSettings()
-                .tabItem { Label("Keymaps", systemImage: "keyboard") }
-            UpdatesSettings()
-                .tabItem { Label("Updates", systemImage: "arrow.triangle.2.circlepath") }
+/// The panes of the settings window, in sidebar order. Titles are the
+/// user-visible sidebar labels — Title Case, matching the macOS convention the
+/// rest of the app's menus follow.
+private enum SettingsPane: String, CaseIterable, Identifiable {
+    case general = "General"
+    case projects = "Projects"
+    case appearance = "Appearance"
+    case quickTerminal = "Quick Terminal"
+    case keymaps = "Keymaps"
+    case updates = "Updates"
+
+    var id: String { rawValue }
+    var title: String { rawValue }
+
+    var symbol: String {
+        switch self {
+        case .general: "gearshape"
+        case .projects: "folder"
+        case .appearance: "paintpalette"
+        case .quickTerminal: "rectangle.bottomthird.inset.filled"
+        case .keymaps: "keyboard"
+        case .updates: "arrow.triangle.2.circlepath"
         }
-        .frame(width: 520, height: 540)
     }
+}
+
+/// Sidebar-style preferences window, mirroring the macOS System Settings
+/// shape: a source list of panes on the left, the selected pane's `Form` on
+/// the right. `NavigationSplitView` is the native container — it also places
+/// the pane title over the detail column, which nothing else does (see
+/// `PinnedSidebar`).
+struct SettingsView: View {
+    @State private var selection: SettingsPane = .general
+
+    /// Sidebar width — the pane list is six short labels, so there's nothing to
+    /// gain from resizing it, and dragging it narrow just truncates them.
+    static let sidebarWidth: CGFloat = 190
+
+    /// Floor for the content column — enough for the widest pane's controls
+    /// (the Keymaps rows) without horizontal clipping.
+    static let detailMinWidth: CGFloat = 440
+
+    static let windowMinHeight: CGFloat = 520
+
+    var body: some View {
+        NavigationSplitView(columnVisibility: .constant(.all)) {
+            List(SettingsPane.allCases, selection: $selection) { pane in
+                NavigationLink(value: pane) {
+                    Label(pane.title, systemImage: pane.symbol)
+                }
+            }
+            .navigationSplitViewColumnWidth(Self.sidebarWidth)
+            .hidingSidebarToggle()
+        } detail: {
+            detail
+                .navigationTitle(selection.title)
+                .frame(minWidth: Self.detailMinWidth)
+        }
+        .background(PinnedSidebar(width: Self.sidebarWidth))
+        .frame(
+            minWidth: Self.sidebarWidth + Self.detailMinWidth,
+            idealWidth: Self.sidebarWidth + Self.detailMinWidth,
+            minHeight: Self.windowMinHeight,
+            idealHeight: 600
+        )
+    }
+
+    @ViewBuilder
+    private var detail: some View {
+        switch selection {
+        case .general: GeneralSettings()
+        case .projects: ProjectsSettings()
+        case .appearance: AppearanceSettings()
+        case .quickTerminal: QuickTerminalSettings()
+        case .keymaps: KeymapSettings()
+        case .updates: UpdatesSettings()
+        }
+    }
+}
+
+// MARK: - Pinned sidebar + window chrome
+
+/// Fixes the sidebar's width, stops it collapsing, and applies the main
+/// window's titlebar chrome.
+///
+/// None of this is expressible in SwiftUI: `navigationSplitViewColumnWidth`
+/// and `columnVisibility` are documented *preferences* the framework may
+/// override ("SwiftUI may use a different width for your column"). The
+/// properties that bind live on `NSSplitViewItem`, reached through the
+/// `NSSplitViewController` SwiftUI builds.
+///
+/// Finding that controller is the trick: it's not in this probe's responder
+/// chain (the probe sits in a `.background`, a sibling subtree) and not a child
+/// of the window's root view controller. It *owns* the split view, so the route
+/// is a view-tree walk down to the `NSSplitView`, then a responder walk up.
+/// Replacing the split view's delegate is not an option — AppKit raises
+/// "a SplitView managed by a SplitViewController cannot have its delegate
+/// modified" and the app dies.
+///
+/// The pin is re-applied from two notifications, not just SwiftUI updates.
+/// `NSWindow.didResizeNotification` covers a window resize. The important one
+/// is `NSSplitView.didResizeSubviewsNotification`, which covers a **divider
+/// drag** — dragging never resizes the window, so without it a drag to the far
+/// left collapsed the sidebar to zero and nothing put it back. SwiftUI's split
+/// view controller can collapse the column from its own state even with
+/// `canCollapse` false, so restoring it there is the backstop.
+///
+/// **Why a shield rather than constraints alone.** The constraints above do
+/// lock the column — with every re-assert disabled, drags left, right, and past
+/// the window edge all left it at exactly its pinned width. But they don't
+/// *stay* applied: SwiftUI re-applies its own column metrics on events we can't
+/// enumerate (a window move fires neither a resize nor an `updateNSView`), and
+/// once it does the drag affordance returns and the column can collapse until
+/// the next re-assert. Observed directly: no handle on a freshly opened window,
+/// handle back after moving the window or switching panes, and a collapsed
+/// sidebar springing back on the next focus change.
+///
+/// `DividerShield` doesn't depend on any of that — it sits over the divider and
+/// takes the mouse before AppKit sees it, so it holds no matter what SwiftUI
+/// resets underneath. The constraints stay as the underlying truth; the shield
+/// makes the behavior deterministic.
+///
+/// Alternatives that don't work: the split view's delegate owns the divider's
+/// effective rect, and AppKit raises rather than let a controller-managed
+/// delegate be replaced; a plain (non-`.sidebar`) item drops the affordance but
+/// moves the pane title off the detail column, and
+/// `NSTrackingSeparatorToolbarItem` doesn't move it back — it aligns toolbar
+/// item groups, not the window title.
+private struct PinnedSidebar: NSViewRepresentable {
+    let width: CGFloat
+
+    func makeNSView(context _: Context) -> NSView {
+        // Zero-size and hidden: a handle into the hierarchy, never visible
+        // chrome.
+        let probe = NSView(frame: .zero)
+        probe.isHidden = true
+        return probe
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        // The split view doesn't exist on the first pass; a later update lands
+        // once it does. Every call is idempotent.
+        DispatchQueue.main.async {
+            guard let window = nsView.window else { return }
+            SettingsWindowChrome.apply(to: window)
+            context.coordinator.pin(window: window, width: width)
+        }
+    }
+
+    func makeCoordinator() -> Pinner {
+        Pinner()
+    }
+
+    /// Pairs the resize observer with a removal. Teardown lives here, a
+    /// `@MainActor` hook, rather than in `deinit` — which is `nonisolated`
+    /// under Swift 6 and can't touch the coordinator's non-Sendable observer
+    /// (the same reason `HotkeyCaptureView` tears down this way).
+    static func dismantleNSView(_: NSView, coordinator: Pinner) {
+        coordinator.tearDown()
+    }
+
+    @MainActor
+    final class Pinner {
+        private var observers: [any NSObjectProtocol] = []
+        private var width: CGFloat = 0
+        /// Guards the re-assert: un-collapsing inside a resize notification
+        /// posts another one, which would recurse.
+        private var isReasserting = false
+
+        func pin(window: NSWindow, width: CGFloat) {
+            self.width = width
+            apply(in: window)
+            guard observers.isEmpty else { return }
+            let center = NotificationCenter.default
+            // A window resize.
+            observers.append(center.addObserver(
+                forName: NSWindow.didResizeNotification,
+                object: window,
+                queue: .main
+            ) { [weak self] note in
+                guard let window = note.object as? NSWindow else { return }
+                MainActor.assumeIsolated { self?.apply(in: window) }
+            })
+            // A divider drag. This is the one that matters for the snap-to-zero:
+            // dragging the divider never resizes the WINDOW, so the window
+            // notification above doesn't fire and nothing undoes the collapse.
+            guard let split = window.contentView?.firstSplitView else { return }
+            observers.append(center.addObserver(
+                forName: NSSplitView.didResizeSubviewsNotification,
+                object: split,
+                queue: .main
+            ) { [weak self, weak window] _ in
+                guard let window else { return }
+                MainActor.assumeIsolated { self?.apply(in: window) }
+            })
+        }
+
+        func tearDown() {
+            for observer in observers {
+                NotificationCenter.default.removeObserver(observer)
+            }
+            observers.removeAll()
+        }
+
+        private func apply(in window: NSWindow) {
+            guard !isReasserting,
+                  let split = window.contentView?.firstSplitView,
+                  let controller = split.owningSplitViewController,
+                  let sidebar = controller.splitViewItems.first
+            else { return }
+            isReasserting = true
+            defer { isReasserting = false }
+            // Equal min and max leave no range for a drag to land in, and a
+            // high holding priority makes a window resize take width from the
+            // detail column instead of this one.
+            sidebar.canCollapse = false
+            sidebar.minimumThickness = width
+            sidebar.maximumThickness = width
+            sidebar.holdingPriority = .required
+            // Undo a collapse that slipped through anyway. SwiftUI's split view
+            // controller can collapse the column from its own state even with
+            // `canCollapse` false, so this is the backstop — reached from the
+            // divider-drag notification, which is when it actually happens.
+            if sidebar.isCollapsed { sidebar.isCollapsed = false }
+            // And restore the width if the drag left it anywhere else.
+            let current = sidebar.viewController.view.frame.width
+            if abs(current - width) > 0.5 {
+                split.setPosition(width, ofDividerAt: 0)
+            }
+            positionShield(over: split)
+        }
+
+        /// Keeps an invisible shield over the divider so it shows no resize
+        /// cursor and starts no drag — the affordance stock Settings' sidebar
+        /// doesn't have either.
+        ///
+        /// The shield is a sibling of the split view, never a subview:
+        /// `NSSplitView` treats its subviews as panes, so adding it there would
+        /// create a third column.
+        private func positionShield(over split: NSSplitView) {
+            guard let host = split.superview else { return }
+            let shield = self.shield ?? {
+                let view = DividerShield()
+                self.shield = view
+                return view
+            }()
+            if shield.superview !== host { host.addSubview(shield) }
+            // Cover the divider plus a hair on each side: AppKit's drag region
+            // is slightly wider than the drawn hairline.
+            let padding: CGFloat = 3
+            let dividerInSplit = NSRect(
+                x: width,
+                y: 0,
+                width: max(split.dividerThickness, 1),
+                height: split.bounds.height
+            )
+            shield.frame = host.convert(dividerInSplit, from: split).insetBy(dx: -padding, dy: 0)
+            // Stay above the split view so the divider never sees the mouse.
+            if host.subviews.last !== shield {
+                shield.removeFromSuperview()
+                host.addSubview(shield, positioned: .above, relativeTo: nil)
+            }
+            shield.window?.invalidateCursorRects(for: shield)
+        }
+
+        private var shield: DividerShield?
+    }
+}
+
+/// Invisible cover over the split view's divider. The divider itself can't be
+/// made non-interactive — that lives on the split view's delegate, and AppKit
+/// forbids replacing a controller-managed one — so the mouse is intercepted
+/// before it reaches the divider instead. Drawing nothing, it changes only the
+/// cursor and the drag, not the look.
+private final class DividerShield: NSView {
+    /// Claim every point in bounds, so the divider underneath never receives a
+    /// hover or a click.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard let superview else { return nil }
+        return frame.contains(superview.convert(point, from: superview.superview)) ? self : nil
+    }
+
+    override func resetCursorRects() {
+        // Plain arrow: no resize affordance.
+        addCursorRect(bounds, cursor: .arrow)
+    }
+
+    // Swallow clicks so no drag ever begins.
+    override func mouseDown(with _: NSEvent) {}
+    override func mouseDragged(with _: NSEvent) {}
+    override func mouseUp(with _: NSEvent) {}
+}
+
+private extension NSView {
+    /// First `NSSplitView` at or below this view. The probe sits in a
+    /// `.background` beside the split view rather than inside a column, so the
+    /// search runs down from the window's content view.
+    var firstSplitView: NSSplitView? {
+        if let split = self as? NSSplitView { return split }
+        for subview in subviews {
+            if let found = subview.firstSplitView { return found }
+        }
+        return nil
+    }
+
+    /// The `NSSplitViewController` whose root view this is. A view controller
+    /// inserts itself into its root view's responder chain, so walking up from
+    /// the split view reaches it.
+    var owningSplitViewController: NSSplitViewController? {
+        var responder: NSResponder? = nextResponder
+        while let current = responder {
+            if let controller = current as? NSSplitViewController { return controller }
+            responder = current.nextResponder
+        }
+        return nil
+    }
+}
+
+/// The main window's titlebar chrome, applied to the settings window so the two
+/// match: transparent and separator-less, content extending underneath, and an
+/// empty unified toolbar. Having a toolbar at all is what makes AppKit lay out
+/// the taller titlebar and inset the traffic lights (~23pt, measured identical
+/// to the main window; without one they sit at ~16pt).
+@MainActor
+private enum SettingsWindowChrome {
+    static func apply(to window: NSWindow) {
+        window.titlebarAppearsTransparent = true
+        window.titlebarSeparatorStyle = .none
+        window.styleMask.insert(.fullSizeContentView)
+        // `.unified`, not `.unifiedCompact` — compact shrinks the titlebar back
+        // to its toolbar-less height, losing the spacing the toolbar buys.
+        if window.toolbar == nil {
+            window.toolbar = NSToolbar(identifier: "SettingsToolbar")
+        }
+        // Icon-only, matching the main window's locked display mode — the
+        // default reserves an extra label row, which reads as unexplained
+        // padding under the titlebar.
+        window.toolbar?.displayMode = .iconOnly
+        window.toolbarStyle = .unified
+        // A hard floor at the AppKit level. SwiftUI's `.frame(minWidth:)` is a
+        // layout preference the split view can satisfy by collapsing the
+        // sidebar instead of refusing to shrink.
+        window.minSize = NSSize(
+            width: SettingsView.sidebarWidth + SettingsView.detailMinWidth,
+            height: SettingsView.windowMinHeight
+        )
+    }
+}
+
+// MARK: - Shared styling
+
+extension View {
+    /// The one style for a control's explanatory line. Every pane's
+    /// descriptions went through this by hand before (one had drifted to
+    /// `.footnote`), so it lives in a modifier now.
+    func settingsCaption() -> some View {
+        font(.system(size: 11))
+            .foregroundStyle(.secondary)
+    }
+
+    @ViewBuilder
+    func hidingSidebarToggle() -> some View {
+        if #available(macOS 15.0, *) {
+            toolbar(removing: .sidebarToggle)
+        } else {
+            self
+        }
+    }
+
+    // Drops the sidebar collapse button — there's nothing to reveal when the
+    // pane list is the only way to navigate, and the sidebar can't collapse.
+    // The API landed in macOS 15; on 14 the pinned `columnVisibility` already
+    // makes the button inert, so the older system keeps a harmless no-op
+    // control rather than a broken one.
 }
 
 // MARK: - General
 
 private struct GeneralSettings: View {
-    // Seeded from and written back through `Preferences` (the single
-    // UserDefaults seam that redirects to a wiped side-suite under XCTest).
-    // NOT `@AppStorage`, which binds to `UserDefaults.standard` — banned by the
-    // project, and it diverged from the `.onChange` write-through under test.
+    /// Seeded from and written back through `Preferences` (the single
+    /// UserDefaults seam that redirects to a wiped side-suite under XCTest).
+    /// NOT `@AppStorage`, which binds to `UserDefaults.standard` — banned by the
+    /// project, and it diverged from the `.onChange` write-through under test.
     @State private var autoTilingEnabled: Bool = Preferences.shared.autoTilingEnabled
-    @State private var eagerlyStartProjectTabs: Bool = Preferences.shared.eagerlyStartProjectTabs
-    @State private var terminateSessionsOnQuit: Bool = Preferences.shared.terminateSessionsOnQuit
 
     /// Why session persistence is inactive, when it is. Missing binary is a
     /// dev-build state; an over-budget socket path is an environment problem
@@ -74,13 +428,8 @@ private struct GeneralSettings: View {
                     }
                     .help("Re-read your Ghostty config. Click after saving external edits.")
                 }
-                Text(
-                    "Your Ghostty config controls theme, font, palette, keybinds, and most other terminal settings. "
-                        + "Macterm provides defaults; anything in your Ghostty config overrides them. "
-                        + "Macterm does not auto-detect external edits — click Reload after saving."
-                )
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
+                Text("Controls theme, font, palette, and keybinds. Click Reload after editing it elsewhere.")
+                    .settingsCaption()
             }
 
             Section("Terminal") {
@@ -94,9 +443,8 @@ private struct GeneralSettings: View {
                 .onChange(of: terminalScrollSpeed) { _, v in
                     Preferences.shared.terminalScrollSpeed = v
                 }
-                Text("Controls terminal scrollback speed for trackpads and mouse wheels.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
+                Text("Scrollback speed for trackpads and mouse wheels.")
+                    .settingsCaption()
             }
 
             Section("Layout") {
@@ -105,34 +453,16 @@ private struct GeneralSettings: View {
                         Preferences.shared.autoTilingEnabled = v
                     }
                 Text("Distributes pane sizes evenly on split and close.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-
-                Toggle("Start all tabs of the focused project", isOn: $eagerlyStartProjectTabs)
-                    .onChange(of: eagerlyStartProjectTabs) { _, v in
-                        Preferences.shared.eagerlyStartProjectTabs = v
-                    }
-                Text("Runs every tab's processes when a project opens, not just the active tab. Other projects still load when focused.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
+                    .settingsCaption()
             }
 
-            Section("Session Persistence") {
-                Toggle("Quit terminals when Macterm quits", isOn: $terminateSessionsOnQuit)
-                    .onChange(of: terminateSessionsOnQuit) { _, v in
-                        Preferences.shared.terminateSessionsOnQuit = v
-                    }
-                Text(
-                    "Off (default): shells keep running in the background after you quit and reattach on next launch. "
-                        + "On: quitting stops every terminal's processes."
-                )
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
-
-                // Persistence can be silently unavailable (Supacode shipped the
-                // same probe and users only noticed via a buried log line) —
-                // say so where the toggle lives.
-                if ZmxClient.live.executableURL() == nil {
+            // Shells always keep running after quit and reattach on the next
+            // launch — there's no setting, so the section exists only to report
+            // that persistence is unavailable. It can be silently so (Supacode
+            // shipped the same probe and users only noticed via a buried log
+            // line), which is the whole reason to say it in the UI at all.
+            if ZmxClient.live.executableURL() == nil {
+                Section("Session Persistence") {
                     Label {
                         Text(zmxUnavailableReason)
                     } icon: {
@@ -211,8 +541,7 @@ private struct GhosttyCLIBanner: View {
                     Text("Some features are disabled")
                         .font(.system(size: 13, weight: .semibold))
                     Text(reason.message)
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
+                        .settingsCaption()
                     if let url = Self.detailsURL {
                         Link("Learn more", destination: url)
                             .font(.system(size: 11))
@@ -240,6 +569,7 @@ private struct AppearanceSettings: View {
     @State private var showTabStatusIndicator: Bool = Preferences.shared.showTabStatusIndicator
     @State private var showNewProjectButton: Bool = Preferences.shared.showNewProjectButton
     @State private var tabSwitcherVisibility: String = Preferences.shared.tabSwitcherVisibility.rawValue
+    @State private var tabSwitcherPosition: String = Preferences.shared.tabSwitcherPosition.rawValue
     @State
     private var backgroundOpacity: Double = Preferences.shared.windowOpacity
     @State
@@ -252,6 +582,10 @@ private struct AppearanceSettings: View {
     private var paneDimOpacity: Double = Preferences.shared.paneDimOpacity
     @State
     private var adaptiveTerminalChrome: Bool = Preferences.shared.adaptiveTerminalChromeEnabled
+    /// Inverted view of `Preferences.hideTitleBar`: the control reads as
+    /// "Show toolbar" (on by default), the preference stores the hide.
+    @State
+    private var showToolbar: Bool = !Preferences.shared.hideTitleBar
 
     var body: some View {
         Form {
@@ -273,7 +607,7 @@ private struct AppearanceSettings: View {
                 // inert rather than show a dead picker. "None" off / a style on
                 // are folded into one picker over the two underlying prefs.
                 if WindowAppearance.glassSupported {
-                    Picker("Liquid glass", selection: glassSelection) {
+                    Picker("Liquid Glass", selection: glassSelection) {
                         Text("None").tag(WindowGlassStyle?.none)
                         ForEach(WindowGlassStyle.allCases) { style in
                             Text(style.displayName).tag(WindowGlassStyle?.some(style))
@@ -296,8 +630,7 @@ private struct AppearanceSettings: View {
                 .disabled(backgroundOpacity >= 0.999 || liquidGlass)
 
                 Text(blurFootnote)
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
+                    .settingsCaption()
             }
 
             Section("Terminal") {
@@ -323,8 +656,7 @@ private struct AppearanceSettings: View {
                     Preferences.shared.paneDimOpacity = v
                 }
                 Text("How dark unfocused panes get in a split layout.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
+                    .settingsCaption()
             }
 
             Section("Sidebar") {
@@ -346,40 +678,54 @@ private struct AppearanceSettings: View {
                     .onChange(of: showAgentIcons) { _, v in
                         Preferences.shared.showAgentIcons = v
                     }
-                Text("Replace a tab's icon with the logo of the AI agent running in it (Claude Code, Codex, Gemini…).")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+                Text("Uses the logo of the AI agent running in a tab as its icon.")
+                    .settingsCaption()
 
                 Toggle("Show tab status indicator", isOn: $showTabStatusIndicator)
                     .onChange(of: showTabStatusIndicator) { _, v in
                         Preferences.shared.showTabStatusIndicator = v
                     }
-                Text(
-                    "Replaces a tab’s icon with a spinner while a command is running, " +
-                        "and adds a small status dot when it finishes and awaits attention."
-                )
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
+                Text("Shows a spinner while a command runs, and a dot when it finishes.")
+                    .settingsCaption()
 
                 Toggle("Show New Project button", isOn: $showNewProjectButton)
                     .onChange(of: showNewProjectButton) { _, v in Preferences.shared.showNewProjectButton = v }
                 Text("When hidden, create projects via the command palette or context menu.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
+                    .settingsCaption()
             }
 
             Section("Toolbar") {
-                Picker("Tab switcher", selection: $tabSwitcherVisibility) {
-                    ForEach(TabSwitcherVisibility.allCases) { option in
-                        Text(option.displayName).tag(option.rawValue)
+                Toggle("Show toolbar", isOn: $showToolbar)
+                    .onChange(of: showToolbar) { _, v in
+                        Preferences.shared.hideTitleBar = !v
                     }
+                Text("Hiding it removes the title bar, window buttons, and drag area; switch tabs via the sidebar or ⌘1–9.")
+                    .settingsCaption()
+
+                Group {
+                    Picker("Tab switcher", selection: $tabSwitcherVisibility) {
+                        ForEach(TabSwitcherVisibility.allCases) { option in
+                            Text(option.displayName).tag(option.rawValue)
+                        }
+                    }
+                    .onChange(of: tabSwitcherVisibility) { _, v in
+                        Preferences.shared.tabSwitcherVisibility = TabSwitcherVisibility(rawValue: v) ?? .whenMultiple
+                    }
+                    Text("Numbered control in the title bar for switching tabs by index.")
+                        .settingsCaption()
+
+                    Picker("Tab switcher position", selection: $tabSwitcherPosition) {
+                        ForEach(TabSwitcherPosition.allCases) { option in
+                            Text(option.displayName).tag(option.rawValue)
+                        }
+                    }
+                    .onChange(of: tabSwitcherPosition) { _, v in
+                        Preferences.shared.tabSwitcherPosition = TabSwitcherPosition(rawValue: v) ?? .trailing
+                    }
+                    Text("Left places the switcher before the window title, next to the sidebar.")
+                        .settingsCaption()
                 }
-                .onChange(of: tabSwitcherVisibility) { _, v in
-                    Preferences.shared.tabSwitcherVisibility = TabSwitcherVisibility(rawValue: v) ?? .whenMultiple
-                }
-                Text("Numbered control in the title bar for switching tabs by index.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
+                .disabled(!showToolbar)
             }
         }
         .formStyle(.grouped)
@@ -455,7 +801,7 @@ private struct QuickTerminalSettings: View {
     var body: some View {
         Form {
             Section("Quick Terminal") {
-                Toggle("Enable Quick Terminal", isOn: $enabled)
+                Toggle("Enable quick terminal", isOn: $enabled)
                     .onChange(of: enabled) { _, v in
                         Preferences.shared.quickTerminalEnabled = v
                     }
@@ -492,9 +838,8 @@ private struct QuickTerminalSettings: View {
                         for: HotkeyRegistry.selectedShortcutString(for: .toggleQuickTerminal)
                     )
                 )
-                Text("Rebind in Settings → Keymaps. Works globally, even when Macterm isn't the active app.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
+                Text("Works globally, even when Macterm isn't active. Rebind it in Keymaps.")
+                    .settingsCaption()
             }
         }
         .formStyle(.grouped)
@@ -507,7 +852,37 @@ private struct KeymapSettings: View {
     @State
     private var values: [String: String] = [:]
     @State
+    private var passthrough: [String: Bool] = [:]
+    @State
     private var capturingActionID: String?
+
+    /// Column geometry, shared by the header and every row so the three columns
+    /// actually line up. The keybind width lives on the *button*, not on its
+    /// label, so the header measures the same box the border draws.
+    ///
+    /// Alignment holds only because the header and every row are built as the
+    /// SAME four children — title, flexible spacer, then three fixed-width
+    /// boxes — with an explicit `columnGap`. Both are load-bearing: SwiftUI's
+    /// default `HStack` spacing varies with the *types* of the adjacent views
+    /// (two Texts space differently than a Text and a Button), and because the
+    /// spacer pins everything after it to the trailing edge, one extra child or
+    /// one wider trailing view shifts that row's columns out of line with the
+    /// header. Don't add a control to a row without giving it a box here.
+    private static let columnGap: CGFloat = 8
+    private static let passthroughColumn: CGFloat = 92
+    private static let keybindColumn: CGFloat = 140
+    private static let clearColumn: CGFloat = 20
+    private static let warningColumn: CGFloat = 16
+    private static let trailingColumn: CGFloat = clearColumn + warningColumn
+
+    /// Short enough for a column header; the precise rule lives in the
+    /// checkbox's tooltip rather than a description line under every row.
+    private static let passthroughTitle = "Pass to TUI"
+    private static let passthroughHelp = """
+    When one of the programs listed at the top of this tab is running in the \
+    focused pane, send this chord to it instead of running the action. \
+    Everywhere else the action still runs.
+    """
 
     /// Titles of the *other* actions that share `action`'s binding, for the
     /// inline conflict message.
@@ -537,8 +912,25 @@ private struct KeymapSettings: View {
 
     var body: some View {
         Form {
+            Section("Passthrough Programs") {
+                TextField(
+                    "Programs",
+                    text: Binding(
+                        get: { Preferences.shared.passthroughPrograms },
+                        set: { Preferences.shared.passthroughPrograms = $0 }
+                    ),
+                    prompt: Text(verbatim: "nvim, hx")
+                )
+                Text(
+                    "Keybinds checked below yield to these programs instead of running "
+                        + "their action. Match the name shown in the tab title; separate with commas."
+                )
+                .settingsCaption()
+            }
+
             ForEach(actionsByCategory, id: \.category) { group in
                 Section(group.category.rawValue) {
+                    columnHeader
                     ForEach(group.actions) { action in
                         hotkeyRow(action)
                     }
@@ -559,10 +951,13 @@ private struct KeymapSettings: View {
         )
         .onAppear {
             var map: [String: String] = [:]
+            var flags: [String: Bool] = [:]
             for action in HotkeyAction.allCases {
                 map[action.id] = HotkeyRegistry.selectedShortcutString(for: action)
+                flags[action.id] = HotkeyRegistry.passesThroughToPrograms(for: action)
             }
             values = map
+            passthrough = flags
         }
         .onDisappear {
             capturingActionID = nil
@@ -570,20 +965,56 @@ private struct KeymapSettings: View {
         }
     }
 
+    /// Names the three columns once per section. Repeated per section rather
+    /// than once per pane because each section scrolls independently in a long
+    /// list, and a header that has scrolled away explains nothing.
+    private var columnHeader: some View {
+        HStack(spacing: Self.columnGap) {
+            Text("Action")
+            Spacer(minLength: 0)
+            Text(Self.passthroughTitle)
+                .frame(width: Self.passthroughColumn, alignment: .center)
+            Text("Keybind")
+                .frame(width: Self.keybindColumn, alignment: .leading)
+            // Stands in for each row's trailing block (clear button + warning
+            // slot) as ONE box of the same width, so the two columns to its
+            // left land in the same place in the header as in every row.
+            Spacer().frame(width: Self.trailingColumn)
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+    }
+
+    private func passthroughBinding(_ action: HotkeyAction) -> Binding<Bool> {
+        Binding(
+            get: { passthrough[action.id] ?? false },
+            set: { enabled in
+                passthrough[action.id] = enabled
+                HotkeyRegistry.setPassesThroughToPrograms(enabled, for: action)
+            }
+        )
+    }
+
     @ViewBuilder
     private func hotkeyRow(_ action: HotkeyAction) -> some View {
         let partners = conflictPartners(for: action)
+        let isCapturing = capturingActionID == action.id
+        let isUnmapped = HotkeyRegistry.displaySymbols(for: values[action.id] ?? "disabled").isEmpty
         VStack(alignment: .leading, spacing: 4) {
-            HStack {
+            HStack(spacing: Self.columnGap) {
                 Text(action.title)
-                Spacer()
+                Spacer(minLength: 0)
+
+                Toggle("", isOn: passthroughBinding(action))
+                    .labelsHidden()
+                    .toggleStyle(.checkbox)
+                    .frame(width: Self.passthroughColumn, alignment: .center)
+                    .help(Self.passthroughHelp)
+
                 Button {
                     HotkeyCaptureState.shared.isCapturing = true
                     capturingActionID = action.id
                 } label: {
-                    let isCapturing = capturingActionID == action.id
-                    let isUnmapped = HotkeyRegistry
-                        .displaySymbols(for: values[action.id] ?? "disabled").isEmpty
                     Text(
                         isCapturing
                             ? "Press keys..."
@@ -592,24 +1023,43 @@ private struct KeymapSettings: View {
                     )
                     .font(.system(size: 12, design: .monospaced))
                     .foregroundStyle((isUnmapped && !isCapturing) ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
-                    .frame(width: 140, alignment: .leading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .buttonStyle(.bordered)
+                .frame(width: Self.keybindColumn)
 
-                Button("Clear") {
-                    values[action.id] = "disabled"
-                    HotkeyRegistry.setShortcutString("disabled", for: action)
-                    if capturingActionID == action.id {
-                        capturingActionID = nil
-                        HotkeyCaptureState.shared.isCapturing = false
+                // Both trailing controls in ONE box of `trailingColumn`, spaced
+                // zero: as two siblings they added an extra inter-child gap and
+                // the clear button's own intrinsic width, which is what pushed
+                // every row's columns left of the header labels.
+                HStack(spacing: 0) {
+                    Button {
+                        values[action.id] = "disabled"
+                        HotkeyRegistry.setShortcutString("disabled", for: action)
+                        if capturingActionID == action.id {
+                            capturingActionID = nil
+                            HotkeyCaptureState.shared.isCapturing = false
+                        }
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
                     }
-                }
-                .buttonStyle(.borderless)
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.secondary)
+                    // Nothing to clear on an already-unmapped action, and a
+                    // live control that does nothing reads as broken.
+                    .disabled(isUnmapped)
+                    .help("Clear this keybind")
+                    .frame(width: Self.clearColumn)
 
-                if !partners.isEmpty {
+                    // Space is always reserved: shown conditionally, a conflict
+                    // would shift that row's columns out of line with every
+                    // other row — in exactly the row asking to be read closely.
                     Image(systemName: "exclamationmark.triangle.fill")
                         .foregroundStyle(MactermTheme.warning)
+                        .opacity(partners.isEmpty ? 0 : 1)
+                        .frame(width: Self.warningColumn)
                 }
+                .frame(width: Self.trailingColumn)
             }
 
             if !partners.isEmpty {
@@ -687,6 +1137,8 @@ private struct UpdatesSettings: View {
     private var automaticallyChecks: Bool = Updater.shared.automaticallyChecksForUpdates
     @State
     private var automaticallyDownloads: Bool = Updater.shared.automaticallyDownloadsUpdates
+    @State
+    private var updateChannel: String = Updater.shared.updateChannel.rawValue
 
     var body: some View {
         Form {
@@ -710,11 +1162,22 @@ private struct UpdatesSettings: View {
                     .disabled(!updater.canCheckForUpdates)
                 }
 
-                Text(
-                    "Updates are verified with an EdDSA signature. Macterm does not collect analytics."
-                )
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                Text("Updates are verified with an EdDSA signature. No analytics are collected.")
+                    .settingsCaption()
+            }
+
+            // Deliberately its own section, and NOT disabled when automatic
+            // checks are off: the channel governs which updates are visible to
+            // any check, including a manual "Check for Updates Now".
+            Section("Channel") {
+                Picker("Update channel", selection: $updateChannel) {
+                    ForEach(UpdateChannel.allCases) { option in
+                        Text(option.displayName).tag(option.rawValue)
+                    }
+                }
+                .onChange(of: updateChannel) { _, v in
+                    updater.updateChannel = UpdateChannel(rawValue: v) ?? .stable
+                }
             }
 
             Section("Version") {

@@ -322,6 +322,18 @@ struct HotkeysTests {
     }
 
     @Test
+    func layout_actions_are_unbound_by_default_and_titled_from_command() {
+        // Both ship unbound: applying or saving a layout rewrites the live pane
+        // tree, so a stock binding would make a mistyped chord destructive.
+        #expect(HotkeyAction.applyLayout.defaultShortcut == "none")
+        #expect(HotkeyAction.saveLayout.defaultShortcut == "none")
+        #expect(HotkeyAction.applyLayout.title == "Apply Layout")
+        #expect(HotkeyAction.saveLayout.title == "Save Layout")
+        #expect(AppCommand.applyLayout.hotkeyAction == .applyLayout)
+        #expect(AppCommand.saveLayout.hotkeyAction == .saveLayout)
+    }
+
+    @Test
     func all_action_ids_are_unique() {
         let ids = HotkeyAction.allCases.map(\.rawValue)
         #expect(ids.count == Set(ids).count)
@@ -735,5 +747,27 @@ struct HotkeysTests {
         let cmdE = try keyEvent("e", [.command], keyCode: 14)
         #expect(!HotkeyRegistry.matches(cmdD, action: action))
         #expect(HotkeyRegistry.matches(cmdE, action: action))
+    }
+
+    @Test
+    func rebinding_bumps_the_observable_hotkey_version() {
+        // Hotkey bindings live in raw defaults keys, invisible to SwiftUI, so
+        // the shortcut hints in WelcomeView/EmptyProjectView only refresh when
+        // this version bumps. (The menu bar can't be fixed this way — see
+        // HotkeyMenuSyncTests.)
+        let action = HotkeyAction.splitRight
+        let prior = Preferences.defaults.string(forKey: action.defaultsKey)
+        defer {
+            HotkeyRegistry.setShortcutString(prior ?? action.defaultShortcut, for: action)
+        }
+
+        let before = Preferences.shared.hotkeyVersion
+        HotkeyRegistry.setShortcutString("cmd+e", for: action)
+        #expect(Preferences.shared.hotkeyVersion != before)
+
+        // Clearing a binding is the reported bug's exact path — it must bump too.
+        let afterRebind = Preferences.shared.hotkeyVersion
+        HotkeyRegistry.setShortcutString("disabled", for: action)
+        #expect(Preferences.shared.hotkeyVersion != afterRebind)
     }
 }

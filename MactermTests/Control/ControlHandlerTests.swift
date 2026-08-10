@@ -198,6 +198,24 @@ struct ControlHandlerTests {
         #expect(panes?.last?.focused == true)
         #expect(panes?.allSatisfy { $0.session.hasPrefix("macterm-") } == true)
         #expect(panes?.allSatisfy { $0.cwd == project.path } == true)
+        #expect(panes?.allSatisfy { $0.state == "idle" } == true)
+    }
+
+    @Test
+    func pane_list_reports_running_and_done_states() async throws {
+        let (handler, appState, projectStore) = makeHandler()
+        let project = seedProject(appState, projectStore)
+        appState.isAppActive = { false }
+        let pane = try #require(appState.workspaces[project.id]?.activeTab?.splitRoot.allPanes().first)
+
+        pane.recordUserInteraction()
+        pane.markCommandRunning()
+        var response = await handler.handle(request("pane.list"))
+        #expect(response.data?.panes?.first?.state == "running")
+
+        pane.markCommandFinished()
+        response = await handler.handle(request("pane.list"))
+        #expect(response.data?.panes?.first?.state == "done")
     }
 
     @Test
@@ -307,10 +325,11 @@ struct ControlHandlerTests {
         #expect(projectStore.projects.count == 1)
         #expect(appState.activeProjectID?.uuidString == info?.id)
 
-        // Idempotent: same path returns the existing project, adds nothing.
+        // Not idempotent (one-project-per-directory removed): the same path
+        // adds a distinct project rather than returning the existing one.
         let again = await handler.handle(request("project.create", args: ControlArgs(path: dir.path)))
-        #expect(again.data?.projects?.first?.id == info?.id)
-        #expect(projectStore.projects.count == 1)
+        #expect(again.data?.projects?.first?.id != info?.id)
+        #expect(projectStore.projects.count == 2)
     }
 
     @Test
@@ -393,6 +412,78 @@ struct ControlHandlerTests {
         #expect(empty.error?.code == .badRequest)
     }
 
+    // MARK: - tab.move (#224)
+
+    /// `slot` is the tab's FINAL position, in both directions — the toward-end
+    /// case is the one that would regress if the handler ever passed the slot
+    /// straight into `Workspace.moveTab`'s pre-removal drop-offset coordinates
+    /// (the tab would land one slot short).
+    @Test
+    func tab_move_places_tab_at_final_slot_in_both_directions() async throws {
+        let (handler, appState, projectStore) = makeHandler()
+        let project = seedProject(appState, projectStore)
+        appState.createTab(projectID: project.id, projectPath: project.path)
+        appState.createTab(projectID: project.id, projectPath: project.path)
+        let workspace = try #require(appState.workspaces[project.id])
+        let ids = workspace.tabs.map(\.id)
+        #expect(ids.count == 3)
+
+        // Toward the front: third tab to slot 1.
+        let front = await handler.handle(request("tab.move", args: ControlArgs(tab: "tab:3", slot: 1)))
+        #expect(front.ok)
+        #expect(front.data?.tabs?.first?.index == 1)
+        #expect(workspace.tabs.map(\.id) == [ids[2], ids[0], ids[1]])
+
+        // Toward the end: first tab (the just-moved one) to the last slot.
+        let back = await handler.handle(request("tab.move", args: ControlArgs(tab: "tab:1", slot: 3)))
+        #expect(back.ok)
+        #expect(back.data?.tabs?.first?.index == 3)
+        #expect(workspace.tabs.map(\.id) == ids)
+
+        // Selection keys on the tab's UUID, so it follows the tab, not the slot.
+        #expect(workspace.activeTabID == ids[2])
+    }
+
+    @Test
+    func tab_move_same_slot_is_an_ok_noop() async throws {
+        let (handler, appState, projectStore) = makeHandler()
+        let project = seedProject(appState, projectStore)
+        appState.createTab(projectID: project.id, projectPath: project.path)
+        let workspace = try #require(appState.workspaces[project.id])
+        let before = workspace.tabs.map(\.id)
+
+        let response = await handler.handle(request("tab.move", args: ControlArgs(tab: "tab:2", slot: 2)))
+        #expect(response.ok)
+        #expect(response.data?.tabs?.first?.index == 2)
+        #expect(workspace.tabs.map(\.id) == before)
+    }
+
+    @Test
+    func tab_move_validates_selector_and_slot() async throws {
+        let (handler, appState, projectStore) = makeHandler()
+        let project = seedProject(appState, projectStore)
+        appState.createTab(projectID: project.id, projectPath: project.path)
+        let workspace = try #require(appState.workspaces[project.id])
+        let before = workspace.tabs.map(\.id)
+
+        let noTab = await handler.handle(request("tab.move", args: ControlArgs(slot: 1)))
+        #expect(noTab.error?.code == .badRequest)
+
+        let noSlot = await handler.handle(request("tab.move", args: ControlArgs(tab: "tab:1")))
+        #expect(noSlot.error?.code == .badRequest)
+
+        // Out-of-range slots are rejected, never silently clamped.
+        for slot in [0, 3] {
+            let outOfRange = await handler.handle(request("tab.move", args: ControlArgs(tab: "tab:1", slot: slot)))
+            #expect(outOfRange.error?.code == .badRequest, "slot \(slot)")
+        }
+
+        let unknown = await handler.handle(request("tab.move", args: ControlArgs(tab: "tab:9", slot: 1)))
+        #expect(unknown.error?.code == .notFound)
+
+        #expect(workspace.tabs.map(\.id) == before)
+    }
+
     // MARK: - pane.split / pane.focus / pane.close / pane.run
 
     @Test
@@ -460,6 +551,47 @@ struct ControlHandlerTests {
         #expect(response.ok)
         #expect(workspace.activeTabID == firstTab.id)
         #expect(firstTab.focusedPaneID == firstPane.id)
+    }
+
+    /// The direction makes the resolved pane the ORIGIN. The edge case is the
+    /// contract a vim-tmux-navigator-style keymap depends on: no neighbour that
+    /// way reports the origin unchanged and stays `ok`, so the caller can tell
+    /// "didn't move" from "failed" without parsing an error.
+    @Test
+    func pane_focus_direction_moves_from_the_target_and_no_ops_at_the_edge() async throws {
+        let (handler, appState, projectStore) = makeHandler()
+        let project = seedProject(appState, projectStore)
+        let tab = try #require(appState.workspaces[project.id]?.activeTab)
+        let left = try #require(tab.splitRoot.allPanes().first)
+        appState.splitPane(direction: .horizontal, projectID: project.id)
+        let panes = tab.splitRoot.allPanes()
+        #expect(panes.count == 2)
+        let right = try #require(panes.last)
+        #expect(tab.focusedPaneID == right.id)
+
+        // From the right pane (the focused one, so no selector needed) leftward.
+        let moved = await handler.handle(request("pane.focus", args: ControlArgs(direction: "left")))
+        #expect(moved.ok)
+        #expect(tab.focusedPaneID == left.id)
+        #expect(moved.data?.panes?.first?.id == left.id.uuidString)
+
+        // Already leftmost: ok, focus unchanged, and the reported pane is the
+        // origin — that identity is how a caller detects the edge.
+        let edge = await handler.handle(request("pane.focus", args: ControlArgs(direction: "left")))
+        #expect(edge.ok)
+        #expect(tab.focusedPaneID == left.id)
+        #expect(edge.data?.panes?.first?.id == left.id.uuidString)
+
+        // An explicit origin overrides the focused-pane default.
+        let fromLeft = await handler.handle(request(
+            "pane.focus", args: ControlArgs(pane: left.id.uuidString, direction: "right")
+        ))
+        #expect(fromLeft.ok)
+        #expect(tab.focusedPaneID == right.id)
+
+        // `auto` is split's vocabulary, not focus's.
+        let bogus = await handler.handle(request("pane.focus", args: ControlArgs(direction: "auto")))
+        #expect(bogus.error?.code == .badRequest)
     }
 
     @Test

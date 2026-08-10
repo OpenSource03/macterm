@@ -49,6 +49,15 @@ final class QuickTerminalResponder: KeyResponder {
         guard qt.isVisible else { return .passThrough }
         let state = qt.splitState
 
+        // Passthrough gate, ahead of every branch: a binding the user flagged
+        // yields to the program running in the focused pane (see
+        // KeybindPassthrough). Returning `.passThrough` is only half the job —
+        // `isAppShortcut` would otherwise swallow the chord once the event
+        // reaches the surface's `keyDown`, so it consults the same policy.
+        if KeybindPassthrough.yields(event: event, pane: state.tab.focusedPane) {
+            return .passThrough
+        }
+
         // Quick-terminal toggle keystroke arrived while Macterm itself is
         // active. The same shortcut is also registered as a Carbon global
         // hot key (see QuickTerminalService.registerHotKey) for when other
@@ -151,8 +160,10 @@ final class MainAppResponder: KeyResponder {
         //
         // This branch requires a KNOWN `mainWindow`: it only means "a DIFFERENT
         // window is key" when we know which one is the terminal window. At
-        // launch `mainWindow` is briefly nil (set on `didBecomeMain`, after
-        // responders install), and a nil pointer is `!==` every real window —
+        // launch `mainWindow` can still be briefly nil (its `didBecomeMain`
+        // lands after responders install when the app is launched by direct
+        // exec rather than LaunchServices), and a nil pointer is `!==` every
+        // real window —
         // so without the `let main` guard, the terminal window itself would be
         // treated as "different", making Cmd+W close the window and Cmd+D
         // pass through until the first `didBecomeMain`. When `mainWindow` is
@@ -171,6 +182,18 @@ final class MainAppResponder: KeyResponder {
         }
 
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+
+        // Passthrough gate, ahead of every action branch: a binding the user
+        // flagged yields to the program running in the focused pane (see
+        // KeybindPassthrough). Placed AFTER the different-window branch above —
+        // when another window is key the terminal isn't receiving keys at all,
+        // so that branch's Cmd+W retarget must keep working regardless of what
+        // the terminal's focused pane is running.
+        if let projectID = appState.activeProjectID,
+           KeybindPassthrough.yields(event: event, pane: appState.focusedPane(for: projectID))
+        {
+            return .passThrough
+        }
 
         // Quick-terminal toggle. The same shortcut is also a Carbon global
         // hot key (see QuickTerminalService) for when Macterm isn't active;
@@ -279,17 +302,28 @@ final class MainAppResponder: KeyResponder {
             return .handled
         }
 
-        if HotkeyRegistry.matches(event, action: .reloadGhosttyConfig) {
-            GhosttyApp.shared.reloadAndReport()
-            return .handled
-        }
-
         // These route through AppCommand.action(in:) — the single source of
         // truth shared with the palette and menu bar — so the paths can't drift.
         // Rename defers begin-editing a tick (see AppCommandActions) so the
         // sidebar row's TextField exists before it takes first responder;
-        // copySessionID writes the focused pane's zmx name to the pasteboard.
-        for action in [HotkeyAction.renameTab, .renameProject, .copySessionID] {
+        // copySessionID writes the focused pane's zmx name to the pasteboard;
+        // the layout pair inherits the same enablement guards (no applicable
+        // project file → nil action → the keystroke falls through) and the same
+        // error-presenting wrappers the palette and menu bar get.
+        //
+        // reloadGhosttyConfig joins them rather than calling GhosttyApp
+        // directly: the command action also raises the success toast, and a
+        // second call site would silently skip it.
+        for action in [
+            HotkeyAction.renameTab,
+            .renameProject,
+            .copySessionID,
+            .applyLayout,
+            .saveLayout,
+            .reloadGhosttyConfig,
+            .separateAllPanes,
+            .separateCurrentPane,
+        ] {
             guard HotkeyRegistry.matches(event, action: action),
                   let command = AppCommand.allCases.first(where: { $0.hotkeyAction == action })
             else { continue }

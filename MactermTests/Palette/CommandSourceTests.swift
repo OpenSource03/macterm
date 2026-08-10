@@ -6,10 +6,7 @@ import Testing
 struct CommandSourceTests {
     // MARK: - Helpers
 
-    private func makeContext(
-        seedProject: Bool = true,
-        projectPath: String = "/tmp"
-    ) -> (PaletteContext, AppState) {
+    private func makeContext(seedProject: Bool = true) -> (PaletteContext, AppState) {
         let tmp = FileManager.default.temporaryDirectory
             .appendingPathComponent("macterm-tests-\(UUID().uuidString).json")
         let storeTmp = FileManager.default.temporaryDirectory
@@ -22,7 +19,7 @@ struct CommandSourceTests {
         )
         let store = ProjectStore(fileURL: storeTmp)
         if seedProject {
-            let p = Project(name: "proj", path: projectPath, sortOrder: 0)
+            let p = Project(name: "proj", path: "/tmp", sortOrder: 0)
             store.add(p)
             state.selectProject(p)
         }
@@ -222,44 +219,40 @@ struct CommandSourceTests {
     }
 
     @Test
-    func applyLayout_is_enabled_when_only_a_legacy_layout_exists() throws {
-        // Deprecated migration path (#114): no central file, but the project
-        // carries a committed `.macterm/layout.yaml` — invoking the command
-        // imports it, so it must not be muted. The legacy file lands *after*
-        // the project is open (as for any pre-central-directory project,
-        // whose snapshot suppresses the first-open import).
-        let dir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("macterm-cmdlegacy-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let (ctx, _) = makeContext(projectPath: dir.path)
-
-        let legacy = dir.appendingPathComponent(".macterm/layout.yaml")
-        try FileManager.default.createDirectory(
-            at: legacy.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        try "tabs:\n  - {}\n".write(to: legacy, atomically: true, encoding: .utf8)
-
-        let item = try #require(findItem(title: AppCommand.applyLayout.title, in: ctx))
-        #expect(item.isEnabled)
-    }
-
-    @Test
     func applyLayout_subtitle_names_duplicate_project_files() throws {
+        // Both files are ones the "proj" slug OWNS (`proj.yaml`, `proj_2.yaml`)
+        // — a genuine duplicate of this project's own declaration, which is
+        // what the subtitle warns about.
         let (ctx, state) = makeContext()
         let dir = state.projectFiles.directoryURL
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         try "path: /tmp\ntabs:\n  - {}\n"
-            .write(to: dir.appendingPathComponent("a.yaml"), atomically: true, encoding: .utf8)
+            .write(to: dir.appendingPathComponent("proj.yaml"), atomically: true, encoding: .utf8)
         try "path: /tmp\n"
-            .write(to: dir.appendingPathComponent("b.yaml"), atomically: true, encoding: .utf8)
+            .write(to: dir.appendingPathComponent("proj_2.yaml"), atomically: true, encoding: .utf8)
 
         let item = try #require(findItem(title: AppCommand.applyLayout.title, in: ctx))
         #expect(item.isEnabled)
         let subtitle = try #require(item.subtitle)
-        #expect(subtitle.contains("a.yaml"))
-        #expect(subtitle.contains("b.yaml"))
+        #expect(subtitle.contains("proj.yaml"))
+        #expect(subtitle.contains("proj_2.yaml"))
+    }
+
+    @Test
+    func applyLayout_subtitle_ignores_a_sibling_projects_file() throws {
+        // A distinct-name project on the same directory owns its own file.
+        // That's not a duplicate of ours, so no "ignoring duplicate" hint.
+        let (ctx, state) = makeContext()
+        let dir = state.projectFiles.directoryURL
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try "path: /tmp\ntabs:\n  - {}\n"
+            .write(to: dir.appendingPathComponent("proj.yaml"), atomically: true, encoding: .utf8)
+        try "name: other\npath: /tmp\ntabs:\n  - {}\n"
+            .write(to: dir.appendingPathComponent("other.yaml"), atomically: true, encoding: .utf8)
+
+        let item = try #require(findItem(title: AppCommand.applyLayout.title, in: ctx))
+        #expect(item.isEnabled)
+        #expect(item.subtitle == nil)
     }
 
     // MARK: - items(query:) — the search path (6.7)

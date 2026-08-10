@@ -19,6 +19,45 @@ enum TabSwitcherVisibility: String, CaseIterable, Identifiable {
     }
 }
 
+/// Which edge of the title bar the numbered tab switcher sits on (#186).
+/// `leading` maps to the `.navigation` toolbar slot, which AppKit places
+/// ahead of the inline window title — the switcher hugs the sidebar edge
+/// and the title shifts right of it.
+/// Which Sparkle appcast channel the updater draws from.
+///
+/// `stable` maps to Sparkle's default channel (items with no
+/// `<sparkle:channel>`); `beta` additionally allows items tagged
+/// `<sparkle:channel>beta</sparkle:channel>`. The raw values are persisted, so
+/// renaming a case is a stored-preference migration — and `beta`'s raw value is
+/// the channel name sent to Sparkle, matching `betaUpdateChannel`.
+enum UpdateChannel: String, CaseIterable, Identifiable {
+    case stable
+    case beta
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .stable: "Stable"
+        case .beta: "Beta"
+        }
+    }
+}
+
+enum TabSwitcherPosition: String, CaseIterable, Identifiable {
+    case leading
+    case trailing
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .leading: "Left"
+        case .trailing: "Right"
+        }
+    }
+}
+
 /// Which `NSGlassEffectView.Style` the liquid-glass window background uses.
 /// Maps to AppKit's `.regular` / `.clear` (see `WindowAppearance`).
 enum WindowGlassStyle: String, CaseIterable, Identifiable {
@@ -64,12 +103,6 @@ final class Preferences {
         }
     }
 
-    /// Start every tab of the focused project immediately (off-screen) rather
-    /// than only the active tab. Defaults to on.
-    var eagerlyStartProjectTabs: Bool {
-        didSet { defaults.set(eagerlyStartProjectTabs, forKey: Keys.eagerlyStartProjectTabs) }
-    }
-
     /// Multiplier applied to terminal scroll wheel / trackpad row deltas.
     var terminalScrollSpeed: Double {
         didSet { defaults.set(terminalScrollSpeed, forKey: Keys.terminalScrollSpeed) }
@@ -108,19 +141,45 @@ final class Preferences {
         didSet { defaults.set(showNewProjectButton, forKey: Keys.showNewProjectButton) }
     }
 
-    /// When true, quitting Macterm kills every pane's zmx session so nothing
-    /// keeps running in the background. Default off — session persistence
-    /// (shells survive quit and reattach on relaunch) is the point, so quit
-    /// detaches rather than terminates. Macterm-side only; never touches the
-    /// ghostty config pipeline.
-    var terminateSessionsOnQuit: Bool {
-        didSet { defaults.set(terminateSessionsOnQuit, forKey: Keys.terminateSessionsOnQuit) }
+    /// Which appcast channel auto-updates come from. Read by `Updater`'s
+    /// `allowedChannelsForUpdater`, so `.beta` makes prerelease items visible to
+    /// both the scheduled check and "Check for Updates…". Defaults to `.stable`:
+    /// the only channel a fresh install ever sees.
+    ///
+    /// Sparkle reads `allowedChannels` fresh on every check, so changing this
+    /// takes effect on the next check with no restart.
+    var updateChannel: UpdateChannel {
+        didSet { defaults.set(updateChannel.rawValue, forKey: Keys.updateChannel) }
+    }
+
+    // MARK: - Hotkeys
+
+    /// Bumped by `HotkeyRegistry.setShortcutString` on every rebind. Hotkey
+    /// bindings live in raw UserDefaults keys (`macterm.hotkey.<action_id>`),
+    /// not in a `Preferences` property, so SwiftUI has nothing to observe when
+    /// one changes. Ordinary views that render a binding (the shortcut hints in
+    /// `WelcomeView`/`EmptyProjectView`) read this to register a dependency and
+    /// refresh on rebind.
+    ///
+    /// This does *not* reach the menu bar: a SwiftUI `.commands` tree is built
+    /// once and never re-evaluated from observable state, so no amount of
+    /// invalidation updates a `.keyboardShortcut`. `HotkeyMenuSync` patches the
+    /// live `NSMenuItem`s for that.
+    private(set) var hotkeyVersion = 0
+
+    /// Not persisted — the version only orders rebuilds within a launch.
+    func bumpHotkeyVersion() {
+        hotkeyVersion &+= 1
     }
 
     // MARK: - Toolbar
 
     var tabSwitcherVisibility: TabSwitcherVisibility {
         didSet { defaults.set(tabSwitcherVisibility.rawValue, forKey: Keys.tabSwitcherVisibility) }
+    }
+
+    var tabSwitcherPosition: TabSwitcherPosition {
+        didSet { defaults.set(tabSwitcherPosition.rawValue, forKey: Keys.tabSwitcherPosition) }
     }
 
     /// Sentinel for "no icon" — sidebar rows skip the leading glyph when set.
@@ -235,6 +294,19 @@ final class Preferences {
         }
     }
 
+    /// Hide the window's title bar entirely: the toolbar (sidebar toggle, tab
+    /// switcher, update button), the title text, and — a side effect of
+    /// SwiftUI removing the window toolbar — the traffic lights. The sidebar
+    /// and terminal surface extend to the window's top edge. Tab switching
+    /// stays available via the sidebar and Cmd+1…9; close/minimize/zoom stay
+    /// available from the Window menu. No AppKit private API involved: the
+    /// window keeps its normal style mask, so edge-resizing still works.
+    var hideTitleBar: Bool {
+        didSet {
+            defaults.set(hideTitleBar, forKey: Keys.hideTitleBar)
+        }
+    }
+
     // MARK: - Ghostty config
 
     /// Path to the user's Ghostty config. Empty string = don't load any user
@@ -256,6 +328,19 @@ final class Preferences {
     var expandedUserGhosttyConfigPath: String {
         guard !userGhosttyConfigPath.isEmpty else { return "" }
         return (userGhosttyConfigPath as NSString).expandingTildeInPath
+    }
+
+    /// Programs a passthrough-flagged keybind yields to, as the user typed them
+    /// (`nvim, hx`). Stored raw so the Settings field round-trips their spacing
+    /// verbatim; `KeybindPassthrough.programNames` does the parsing and is the
+    /// only thing that should read this for matching.
+    ///
+    /// Empty by default: a name list is the user's to author, and until they
+    /// name something a flagged keybind simply keeps firing its action.
+    var passthroughPrograms: String {
+        didSet {
+            defaults.set(passthroughPrograms, forKey: Keys.passthroughPrograms)
+        }
     }
 
     /// Window-level appearance + libghostty reload. Both happen on the same
@@ -332,7 +417,6 @@ final class Preferences {
     private init(defaults: UserDefaults) {
         self.defaults = defaults
         autoTilingEnabled = defaults.bool(forKey: Keys.autoTiling)
-        eagerlyStartProjectTabs = (defaults.object(forKey: Keys.eagerlyStartProjectTabs) as? Bool) ?? true
         terminalScrollSpeed = Self.clampScrollSpeed(defaults.double(forKey: Keys.terminalScrollSpeed), fallback: 1.0)
         paneDimOpacity = Self.clampPaneDimOpacity(
             (defaults.object(forKey: Keys.paneDimOpacity) as? Double) ?? 0.2
@@ -343,7 +427,9 @@ final class Preferences {
         windowGlassStyle = (defaults.string(forKey: Keys.windowGlassStyle))
             .flatMap(WindowGlassStyle.init(rawValue:)) ?? .regular
         adaptiveTerminalChromeEnabled = defaults.object(forKey: Keys.adaptiveTerminalChromeEnabled) as? Bool ?? false
+        hideTitleBar = defaults.object(forKey: Keys.hideTitleBar) as? Bool ?? false
         userGhosttyConfigPath = defaults.string(forKey: Keys.userGhosttyConfigPath) ?? "~/.config/ghostty/config"
+        passthroughPrograms = defaults.string(forKey: Keys.passthroughPrograms) ?? ""
         quickTerminalEnabled = defaults.object(forKey: Keys.quickTerminalEnabled) as? Bool ?? true
         quickTerminalWidthFraction = Self.clampFraction(defaults.double(forKey: Keys.quickTerminalWidth), fallback: 0.6)
         quickTerminalHeightFraction = Self.clampFraction(defaults.double(forKey: Keys.quickTerminalHeight), fallback: 0.5)
@@ -353,9 +439,12 @@ final class Preferences {
         showAgentIcons = defaults.object(forKey: Keys.showAgentIcons) as? Bool ?? true
         showTabStatusIndicator = defaults.object(forKey: Keys.showTabStatusIndicator) as? Bool ?? false
         showNewProjectButton = defaults.object(forKey: Keys.showNewProjectButton) as? Bool ?? true
-        terminateSessionsOnQuit = defaults.object(forKey: Keys.terminateSessionsOnQuit) as? Bool ?? false
+        updateChannel = (defaults.string(forKey: Keys.updateChannel))
+            .flatMap(UpdateChannel.init(rawValue:)) ?? .stable
         tabSwitcherVisibility = (defaults.string(forKey: Keys.tabSwitcherVisibility))
             .flatMap(TabSwitcherVisibility.init(rawValue:)) ?? .whenMultiple
+        tabSwitcherPosition = (defaults.string(forKey: Keys.tabSwitcherPosition))
+            .flatMap(TabSwitcherPosition.init(rawValue:)) ?? .trailing
         Self.runOneTimeMigrations(defaults: defaults)
     }
 
@@ -386,13 +475,21 @@ final class Preferences {
             defaults.removeObject(forKey: "macterm.input.optionAsAlt")
             defaults.set(true, forKey: Keys.migrationV2GhosttyConfigOwned)
         }
+        // Eager tab start and session persistence are both unconditional now,
+        // so their keys are dead. Drop the stored values rather than leave them
+        // to silently take effect again if anything is ever wired back onto
+        // those keys.
+        if !defaults.bool(forKey: Keys.migrationRetiredToggleKeys) {
+            defaults.removeObject(forKey: "macterm.eagerlyStartProjectTabs.enabled")
+            defaults.removeObject(forKey: "macterm.session.terminateOnQuit")
+            defaults.set(true, forKey: Keys.migrationRetiredToggleKeys)
+        }
     }
 
     // MARK: - UserDefaults keys
 
     enum Keys {
         static let autoTiling = "macterm.autoTiling.enabled"
-        static let eagerlyStartProjectTabs = "macterm.eagerlyStartProjectTabs.enabled"
         static let terminalScrollSpeed = "macterm.terminal.scrollSpeed"
         static let paneDimOpacity = "macterm.pane.dimOpacity"
         static let windowOpacity = "macterm.window.opacity"
@@ -400,7 +497,9 @@ final class Preferences {
         static let windowGlassEnabled = "macterm.window.glassEnabled"
         static let windowGlassStyle = "macterm.window.glassStyle"
         static let adaptiveTerminalChromeEnabled = "macterm.window.adaptiveTerminalChromeEnabled"
+        static let hideTitleBar = "macterm.window.hideTitleBar"
         static let userGhosttyConfigPath = "macterm.ghostty.userConfigPath"
+        static let passthroughPrograms = "macterm.hotkey.passthroughPrograms"
         static let quickTerminalEnabled = "macterm.quickTerminal.enabled"
         static let quickTerminalWidth = "macterm.quickTerminal.width"
         static let quickTerminalHeight = "macterm.quickTerminal.height"
@@ -410,8 +509,10 @@ final class Preferences {
         static let showAgentIcons = "macterm.sidebar.showAgentIcons"
         static let showTabStatusIndicator = "macterm.sidebar.showTabStatusIndicator"
         static let showNewProjectButton = "macterm.sidebar.showNewProjectButton"
-        static let terminateSessionsOnQuit = "macterm.session.terminateOnQuit"
+        static let updateChannel = "macterm.updates.channel"
         static let tabSwitcherVisibility = "macterm.toolbar.tabSwitcherVisibility"
+        static let tabSwitcherPosition = "macterm.toolbar.tabSwitcherPosition"
         static let migrationV2GhosttyConfigOwned = "macterm.migration.v2_ghostty_config_owned"
+        static let migrationRetiredToggleKeys = "macterm.migration.retired_toggle_keys"
     }
 }

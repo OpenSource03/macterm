@@ -9,7 +9,51 @@ on:
     types: [published]
 
 jobs:
+  # Resolve the prerelease flag ONCE, live, from the release itself — never from
+  # `github.event.release.prerelease`.
+  #
+  # The payload is a snapshot frozen when the event was dispatched, and editing a
+  # release does not re-fire `published`. Promote a prerelease to stable in the
+  # same breath as publishing it and every job reads the STALE value: v1.21.0
+  # shipped that way (2026-08-01, run 30699334224) — the release record said
+  # `prerelease: false`, the payload said true, so `bump-cask` skipped and the
+  # appcast never got an item. The giveaway was the run's display title, still
+  # showing the pre-edit release name ("Macterm v1.20.11") against tag v1.21.0.
+  #
+  # `gh release view` asks the API for current truth, so this is correct no matter
+  # which activity type fired or how the release was edited beforehand. Preferred
+  # over adding `released` to `types:` because that only patches the one path we
+  # happened to hit, and GitHub's own docs don't state whether `released` fires on
+  # an edit-to-promote at all — the guess that "the event surely reflects the
+  # release" is what caused this bug, so don't re-make it in a new spot.
+  flag:
+    runs-on: ubuntu-latest
+    # Explicit: reading a release only needs contents:read, and declaring it
+    # keeps the job working if the repo's default workflow token is ever
+    # tightened.
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    outputs:
+      prerelease: ${{ steps.read.outputs.prerelease }}
+    steps:
+      - name: Read live prerelease flag
+        id: read
+        run: |
+          PRERELEASE=$(gh release view "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" --json isPrerelease --jq '.isPrerelease')
+          # Fail loudly rather than defaulting: a silent "false" would leak a
+          # beta into the stable channel and the Homebrew tap.
+          if [[ "$PRERELEASE" != "true" && "$PRERELEASE" != "false" ]]; then
+            echo "error: could not read prerelease flag for '$GITHUB_REF_NAME' (got '$PRERELEASE')" >&2
+            exit 1
+          fi
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+          echo "Live prerelease flag for $GITHUB_REF_NAME: $PRERELEASE"
+
   build:
+    needs: flag
     runs-on: macos-26
     permissions:
       contents: write
@@ -20,7 +64,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: jdx/mise-action@v4
+      - uses: jdx/mise-action@v4.2.3
 
       # ISO week (YYYY-Www) — makes the GhosttyKit cache self-refresh weekly.
       - name: Cache epoch
@@ -40,9 +84,12 @@ jobs:
             Macterm/Resources/ghostty
             Macterm/Resources/terminfo
             Macterm/Resources/zmx
+            .ghosttykit-tag
+          # The tag stamp is cached with the artifacts it describes (test.yml).
+          #
           # NO restore-keys fallback: pairing a time-rolling key with a prefix
           # restore-key re-saves stale content under the fresh key forever (see
-          # checks.yml). Without it a new week re-downloads the current `latest`.
+          # test.yml). Without it a new week re-downloads the current `latest`.
           key: ghosttykit-${{ hashFiles('scripts/setup.sh') }}-${{ steps.epoch.outputs.week }}
 
       - name: Setup GhosttyKit
@@ -51,16 +98,28 @@ jobs:
       - name: Build universal release artifact
         env:
           SPARKLE_ED_PUBLIC_KEY: ${{ secrets.SPARKLE_ED_PUBLIC_KEY }}
+          PRERELEASE: ${{ needs.flag.outputs.prerelease }}
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "error: tag '$GITHUB_REF_NAME' is not vX.Y.Z; refusing to build a placeholder release" >&2
+          # A `-beta.N` suffix is accepted ONLY on a release flagged prerelease,
+          # so a stable release can never ship a beta version string (and a beta
+          # tag can't sneak into the stable channel by forgetting the flag).
+          if [[ "$PRERELEASE" == "true" ]]; then
+            PATTERN='^[0-9]+\.[0-9]+\.[0-9]+(-beta\.[0-9]+)?$'
+            EXPECTED="vX.Y.Z or vX.Y.Z-beta.N"
+          else
+            PATTERN='^[0-9]+\.[0-9]+\.[0-9]+$'
+            EXPECTED="vX.Y.Z"
+          fi
+          if ! [[ "$VERSION" =~ $PATTERN ]]; then
+            echo "error: tag '$GITHUB_REF_NAME' is not $EXPECTED; refusing to build a placeholder release" >&2
             exit 1
           fi
           # Release builds invoke the build script directly to skip the
           # format/lint/test deps on `mise run build` — main is already
-          # format/lint/test-gated by checks.yml before a tag is cut, so a
-          # release just needs the build itself. Equivalent to the old ci:build.
+          # format/lint-gated by checks.yml and test-gated by test.yml before
+          # a tag is cut, so a release just needs the build itself. Equivalent
+          # to the old ci:build.
           VERSION="$VERSION" ./scripts/build.sh
 
       - name: Upload artifact
@@ -70,7 +129,7 @@ jobs:
           path: build/*.dmg
 
   release:
-    needs: build
+    needs: [flag, build]
     runs-on: macos-26
     permissions:
       contents: write
@@ -78,6 +137,10 @@ jobs:
       id-token: write
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Job-level so both the version gate and the appcast step read the same
+      # flag. Sourced from the `flag` job's live API read, not the event payload
+      # (see the comment there). Renders as the string "true"/"false".
+      PRERELEASE: ${{ needs.flag.outputs.prerelease }}
     outputs:
       version: ${{ steps.release.outputs.version }}
     steps:
@@ -95,15 +158,26 @@ jobs:
         id: release
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "error: tag '$GITHUB_REF_NAME' is not vX.Y.Z; refusing to publish a placeholder release" >&2
+          # Mirrors the build job's gate (see the comment there).
+          if [[ "$PRERELEASE" == "true" ]]; then
+            PATTERN='^[0-9]+\.[0-9]+\.[0-9]+(-beta\.[0-9]+)?$'
+            EXPECTED="vX.Y.Z or vX.Y.Z-beta.N"
+          else
+            PATTERN='^[0-9]+\.[0-9]+\.[0-9]+$'
+            EXPECTED="vX.Y.Z"
+          fi
+          if ! [[ "$VERSION" =~ $PATTERN ]]; then
+            echo "error: tag '$GITHUB_REF_NAME' is not $EXPECTED; refusing to publish a placeholder release" >&2
             exit 1
           fi
           TAG="v${VERSION}"
           gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "Macterm $TAG" --generate-notes
           gh release upload "$TAG" dmgs/*.dmg --clobber
-          # Ensure the release is published (not left as draft).
-          gh release edit "$TAG" --draft=false
+          # Ensure the release is published (not left as draft), and re-assert
+          # the prerelease flag explicitly: publishing a draft in the same call
+          # would otherwise be a chance to drop it, which would leak a beta
+          # into the stable channel on a re-run.
+          gh release edit "$TAG" --draft=false --prerelease="$PRERELEASE"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
@@ -111,10 +185,13 @@ jobs:
       # Sparkle's `sign_update` produces an EdDSA signature for each DMG.
       # We then append a new <item> to the appcast on the gh-pages branch,
       # which is served as https://thdxg.github.io/macterm/appcast.xml.
+      #
+      # BOTH stable and prerelease publish here now — one feed, two channels.
+      # A prerelease's <item> carries <sparkle:channel>beta</sparkle:channel>,
+      # which Sparkle hides from any updater that hasn't opted into the `beta`
+      # channel. What still stays stable-only is the Homebrew tap (below).
 
       - name: Install Sparkle tools
-        # Prereleases don't touch the stable auto-update feed.
-        if: ${{ !github.event.release.prerelease }}
         run: |
           SPARKLE_VERSION="2.9.1"
           curl -fsSL "https://github.com/sparkle-project/Sparkle/releases/download/${SPARKLE_VERSION}/Sparkle-${SPARKLE_VERSION}.tar.xz" -o sparkle.tar.xz
@@ -122,7 +199,6 @@ jobs:
           echo "$PWD/sparkle/bin" >> "$GITHUB_PATH"
 
       - name: Publish appcast to gh-pages
-        if: ${{ !github.event.release.prerelease }}
         env:
           SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
           VERSION: ${{ steps.release.outputs.version }}
@@ -130,9 +206,17 @@ jobs:
         run: scripts/publish-appcast.sh dmgs
 
   bump-cask:
-    needs: release
+    needs: [flag, release]
     # Prereleases never bump the Homebrew tap — stable installs stay stable.
-    if: ${{ !github.event.release.prerelease }}
+    #
+    # Compared as an explicit string, NOT `!needs.flag.outputs.prerelease`. Job
+    # outputs are always strings, and every non-empty string is truthy in a
+    # GitHub expression — so `!'false'` is `false` and the negation form would
+    # skip this job on EVERY release, stable ones included. (The old
+    # `!github.event.release.prerelease` was safe only because the event payload
+    # carries a real JSON boolean; that property is lost the moment the value
+    # comes from a job output.)
+    if: ${{ needs.flag.outputs.prerelease == 'false' }}
     runs-on: macos-26
     env:
       GH_TOKEN: ${{ secrets.HOMEBREW_TAP_PAT }}

@@ -88,6 +88,34 @@ final class AppState {
 
     var pendingLayoutError: LayoutError?
 
+    /// Bumped whenever the app itself writes a project file, so an open
+    /// Projects settings pane can re-read the directory. There's no file
+    /// watcher by design (hand-edits surface on next use); this covers only
+    /// the changes Macterm makes, which the user does expect to see land.
+    private(set) var layoutFilesVersion = 0
+
+    func noteLayoutFilesChanged() {
+        layoutFilesVersion &+= 1
+    }
+
+    /// The transient success confirmation showing in `ToastOverlay`, if any.
+    /// Only for outcomes that leave no visible trace — failures still raise a
+    /// dialog, which a toast must never replace.
+    private(set) var activeToast: Toast?
+
+    /// Show `toast`, replacing any toast already up (the newest outcome is the
+    /// one worth reading).
+    func presentToast(_ title: String, subtitle: String? = nil) {
+        activeToast = Toast(title: title, subtitle: subtitle)
+    }
+
+    /// Dismiss the toast with `id` — a no-op if it was already replaced by a
+    /// newer one, so a stale auto-dismiss can't cut the new toast short.
+    func dismissToast(_ id: UUID) {
+        guard activeToast?.id == id else { return }
+        activeToast = nil
+    }
+
     /// Presents the "New Remote Project" sheet (#104) — set by the palette
     /// command and the sidebar's New Project menu, consumed by `MainWindow`.
     var isNewRemoteProjectSheetPresented = false
@@ -161,21 +189,6 @@ final class AppState {
         (NSApp?.windows ?? []).contains { $0.isVisible && $0.occlusionState.contains(.visible) }
     }
 
-    /// Whether a pane's surface is occluded — its renderer parked by
-    /// `ghostty_surface_set_occlusion`, so render/scrollbar heartbeats are
-    /// suppressed and silence says nothing about completion. Injectable for
-    /// tests. "No window" counts as occluded, which also covers panes
-    /// incubated off-screen (the incubator window is never visible).
-    @ObservationIgnored
-    var paneIsOccluded: (Pane) -> Bool = { pane in
-        !(pane.nsView?.window?.occlusionState.contains(.visible) ?? false)
-    }
-
-    /// Panes that were occluded on the previous poll tick, so the visible
-    /// transition can restart their quiet window before settling resumes.
-    @ObservationIgnored
-    private var previouslyOccludedPanes: Set<UUID> = []
-
     /// zmx session-persistence client. Injectable so tests can observe
     /// session kills without a real daemon.
     @ObservationIgnored
@@ -236,8 +249,20 @@ final class AppState {
         let onEvent: @Sendable (Notification) -> Void = { [weak self] _ in
             MainActor.assumeIsolated { self?.notePollEvent() }
         }
+        let onQuietSettleDeadline: @Sendable (Notification) -> Void = { [weak self] _ in
+            // Do not route through notePollEvent: if another poll ran within
+            // 250ms, coalescing plus a fully occluded window would pause with
+            // no timer and never retry this deadline.
+            MainActor.assumeIsolated { self?.pollNow() }
+        }
         let tokens: [(NotificationCenter, NSObjectProtocol)] = [
             (center, center.addObserver(forName: .terminalPollEvent, object: nil, queue: .main, using: onEvent)),
+            (center, center.addObserver(
+                forName: .terminalQuietSettleDeadline,
+                object: nil,
+                queue: .main,
+                using: onQuietSettleDeadline
+            )),
             (center, center.addObserver(
                 forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main, using: onEvent
             )),
@@ -375,13 +400,11 @@ final class AppState {
         // this feature.
         let trackExecution = Preferences.shared.showTabStatusIndicator
         var didAcknowledgeCompletion = false
-        var seenPanes: Set<UUID> = []
         var sawBusyPane = false
         var activeRemotePanes: [Pane] = []
         for (projectID, ws) in workspaces {
             for tab in ws.tabs {
                 for pane in tab.splitRoot.allPanes() {
-                    seenPanes.insert(pane.id)
                     if pane.isRemote {
                         // The local process table only knows `ssh` here — a
                         // local refresh would stomp the probe-derived name
@@ -395,8 +418,12 @@ final class AppState {
                     } else {
                         pane.refreshForegroundProcess(trackExecution: trackExecution)
                     }
+                    // An activity-sourced run whose output has been quiet past
+                    // the window settles to `.done`. The output heartbeat is
+                    // occlusion-independent, so silence is meaningful whether or
+                    // not the pane is on screen — no occlusion special-casing.
                     if trackExecution {
-                        settleIfVisible(pane)
+                        pane.settleTerminalActivityIfQuiet()
                     }
                     if pane.executionState == .running { sawBusyPane = true }
                     didAcknowledgeCompletion = acknowledgeFinishedCommandIfActive(
@@ -407,32 +434,11 @@ final class AppState {
                 }
             }
         }
-        previouslyOccludedPanes.formIntersection(seenPanes)
         lastPollSawBusyPane = sawBusyPane
         if didAcknowledgeCompletion { saveWorkspaces() }
         if !activeRemotePanes.isEmpty, isAnyWindowVisible() {
             remoteForegroundResolver.refresh(panes: activeRemotePanes, probe: zmx.remoteForegroundComms)
         }
-    }
-
-    /// Quiet-settle only while the surface actually renders: an occluded pane
-    /// emits no activity heartbeats (its renderer is parked), so settling it
-    /// would misread suppressed output as completion. On the occluded→visible
-    /// edge the quiet window restarts, giving a still-running program time to
-    /// deliver heartbeats again before the settle can fire.
-    ///
-    /// Not private so tests can drive the guard directly (`paneIsOccluded` is
-    /// injectable) without a live surface or mutating the `Preferences`
-    /// singleton the poll reads.
-    func settleIfVisible(_ pane: Pane) {
-        if paneIsOccluded(pane) {
-            previouslyOccludedPanes.insert(pane.id)
-            return
-        }
-        if previouslyOccludedPanes.remove(pane.id) != nil {
-            pane.refreshTerminalActivityWindow()
-        }
-        pane.settleTerminalActivityIfQuiet()
     }
 
     private func recordProjectVisit(_ projectID: UUID) {
@@ -467,7 +473,7 @@ final class AppState {
         // Restore every project's snapshot — including layout-file projects.
         // The snapshot carries each pane's persisted zmx session identity, so
         // panes REATTACH their still-running shells; force-applying the
-        // committed `.macterm/layout.yaml` here would silently destroy them
+        // project file's declared layout here would silently destroy them
         // on every launch. The layout now only seeds a genuine first open
         // (no snapshot) — `autoApplyLayoutOnFirstOpen` guards on
         // `workspaces[id] == nil`, so a restored snapshot disables it.
@@ -535,12 +541,9 @@ final class AppState {
     /// active one — so a multi-tab project (e.g. from a declarative layout) has
     /// all its processes running on open. Other projects stay lazy. The active
     /// tab is created by SwiftUI as usual; the rest are warmed off-screen via
-    /// `SurfaceIncubator`. No-op when the toggle is off.
+    /// `SurfaceIncubator`.
     func warmFocusedProject() {
-        guard Preferences.shared.eagerlyStartProjectTabs,
-              let projectID = activeProjectID,
-              let ws = workspaces[projectID]
-        else { return }
+        guard let projectID = activeProjectID, let ws = workspaces[projectID] else { return }
         // Stagger the spawns: each warm is a login shell (PAM, rc files) and —
         // when restoring — a `zmx attach` reattaching a daemon. Firing them all
         // in one tick multiplies launch pressure with tab count (cmux hit a
@@ -577,33 +580,16 @@ final class AppState {
     /// no-ops and `ensureWorkspace` creates the default single-pane workspace.
     private func autoApplyLayoutOnFirstOpen(_ project: Project) {
         guard workspaces[project.id] == nil else { return }
-        switch projectFiles.applyState(forProjectPath: project.path) {
+        switch projectFiles.applyState(forProjectPath: project.path, preferredSlug: ProjectSlug.slug(from: project.name)) {
         case .applicable:
             applyLayoutPresentingError(project)
         case .invalid:
             // Surface the parse error; the default workspace is created after.
             applyLayoutPresentingError(project)
-        case .emptyTabs:
+        case .emptyTabs,
+             .none:
             break
-        case .none:
-            // Legacy seed: `applyLayoutPresentingError` imports a committed
-            // `.macterm/layout.yaml` before applying.
-            guard LayoutFile.exists(atProjectRoot: project.path) else { break }
-            applyLayoutPresentingError(project)
         }
-    }
-
-    /// Deprecated seed path — remove next release (#114): a parseable in-repo
-    /// `.macterm/layout.yaml` is imported into the central directory, to then
-    /// be applied from there. Throws when the legacy file doesn't parse — the
-    /// caller surfaces it; nothing is imported.
-    private func importLegacyLayout(_ project: Project) throws {
-        let legacy = try LayoutFile.load(fromProjectRoot: project.path)
-        try projectFiles.write(
-            ProjectFile(name: project.name, path: project.path, tabs: legacy.tabs),
-            projectName: project.name
-        )
-        logger.info("Imported legacy layout for \(project.name, privacy: .public)")
     }
 
     /// Shows an open panel, adds or finds the selected directory as a project,
@@ -616,7 +602,9 @@ final class AppState {
         panel.allowsMultipleSelection = false
         panel.message = "Select a project folder"
         guard panel.runModal() == .OK, let url = panel.url else { return nil }
-        let project = store.findOrCreate(
+        // Always create: picking a folder that already backs a project makes a
+        // second, independent project for it, not a jump to the existing one.
+        let project = store.create(
             name: url.lastPathComponent,
             path: url.path(percentEncoded: false)
         )
@@ -948,6 +936,138 @@ final class AppState {
         saveWorkspaces()
     }
 
+    /// Merge a tab into the destination project's ACTIVE tab at a resolved
+    /// workspace drop target (#227 — dragging a sidebar tab into the
+    /// workspace, where the cursor picks a level: whole-edge, divider, or
+    /// local pane split). No-op when the active tab IS the dragged tab.
+    func mergeTab(
+        _ tabID: UUID,
+        from sourceProjectID: UUID,
+        at target: TabDropResolution.Target,
+        inProject destProjectID: UUID
+    ) {
+        guard let destTab = workspaces[destProjectID]?.activeTab,
+              destTab.id != tabID,
+              let sourceTab = detachTabForMerge(tabID, from: sourceProjectID, to: destProjectID)
+        else { return }
+        guard destTab.mergeTree(sourceTab.splitRoot, at: target) else {
+            // The target pane vanished mid-drag: put the detached tab back
+            // (identity restored) instead of losing its live shells.
+            if sourceProjectID != destProjectID {
+                for pane in sourceTab.splitRoot.allPanes() {
+                    pane.rebind(projectID: sourceProjectID)
+                }
+            }
+            workspaces[sourceProjectID]?.adoptTab(sourceTab)
+            saveWorkspaces()
+            return
+        }
+        finishMerge(intoTab: destTab.id, inProject: destProjectID)
+    }
+
+    /// Pull a tab out of its workspace for a merge, keeping its panes (and
+    /// their surfaces) alive, and restamp their routing identity when the merge
+    /// crosses projects — the same rebind `moveTab` does, for the same reason.
+    private func detachTabForMerge(_ tabID: UUID, from sourceProjectID: UUID, to destProjectID: UUID) -> TerminalTab? {
+        guard let source = workspaces[sourceProjectID],
+              let tab = source.tabs.first(where: { $0.id == tabID })
+        else { return nil }
+        source.closeTab(tabID)
+        if sourceProjectID != destProjectID {
+            for pane in tab.splitRoot.allPanes() {
+                pane.rebind(projectID: destProjectID)
+            }
+        }
+        return tab
+    }
+
+    /// Land the user on the merged tab, mirroring `moveTab`'s selection.
+    private func finishMerge(intoTab destTabID: UUID, inProject destProjectID: UUID) {
+        workspaces[destProjectID]?.selectTab(destTabID)
+        activeProjectID = destProjectID
+        recordProjectVisit(destProjectID)
+        saveWorkspaces()
+    }
+
+    /// Split a tab apart (#227 — "Separate Panes"): every pane after the first
+    /// (in tree order) moves into its own fresh tab inserted right after the
+    /// source tab, and the source keeps only its first pane. The `Pane`
+    /// objects are reused as-is, so surfaces and running shells survive.
+    /// No-op for a single-pane tab.
+    func separateTabPanes(_ tabID: UUID, projectID: UUID) {
+        guard let ws = workspaces[projectID],
+              let index = ws.tabs.firstIndex(where: { $0.id == tabID })
+        else { return }
+        let tab = ws.tabs[index]
+        let panes = tab.splitRoot.allPanes()
+        guard panes.count > 1, let firstPane = panes.first else { return }
+        logger.debug("separateTabPanes: \(tabID, privacy: .public) panes=\(panes.count, privacy: .public)")
+        tab.splitRoot = .pane(firstPane)
+        tab.zoomedPaneID = nil
+        tab.paneFocusHistory = RecencyStack(limit: 20)
+        tab.focusedPaneID = firstPane.id
+        for (offset, pane) in panes.dropFirst().enumerated() {
+            let newTab = TerminalTab(id: UUID(), splitRoot: .pane(pane), focusedPaneID: pane.id)
+            ws.tabs.insert(newTab, at: index + 1 + offset)
+        }
+        ws.selectTab(tabID)
+        saveWorkspaces()
+    }
+
+    /// Split a single pane out of its tab into its own fresh tab — the
+    /// per-pane sibling of `separateTabPanes` ("Separate Current Pane"). The
+    /// `Pane` object is reused as-is, so its surface and running shell
+    /// survive; the source tab keeps its remaining panes. `index` is the
+    /// slot in the destination project's tab list (nil appends). Crossing
+    /// projects rebinds the pane's routing identity, mirroring `moveTab`.
+    /// No-op when the pane isn't in any workspace or is its tab's only pane
+    /// (already its own tab).
+    func separatePane(_ paneID: UUID, toProject destProjectID: UUID, destPath: String, at index: Int? = nil) {
+        guard let (sourceProjectID, sourceTab) = locatePane(paneID),
+              sourceTab.splitRoot.allPanes().count > 1,
+              let pane = sourceTab.splitRoot.findPane(id: paneID)
+        else { return }
+        // Resolve the destination before detaching, so a failure can't leave
+        // the pane belonging to no tab.
+        ensureWorkspace(projectID: destProjectID, path: destPath)
+        guard let dest = workspaces[destProjectID],
+              let remaining = sourceTab.splitRoot.removing(paneID: paneID)
+        else { return }
+        logger.debug(
+            "separatePane: \(paneID, privacy: .public) to=\(destProjectID, privacy: .public) index=\(index ?? -1, privacy: .public)"
+        )
+        // Detach without destroying: the same tree/zoom/focus repair as
+        // `removePane`, minus the surface teardown — the pane lives on.
+        sourceTab.splitRoot = remaining
+        if sourceTab.zoomedPaneID == paneID { sourceTab.zoomedPaneID = nil }
+        sourceTab.paneFocusHistory.remove(paneID)
+        if sourceTab.focusedPaneID == paneID {
+            sourceTab.focusedPaneID = sourceTab.nextFocusAfterClose()
+        }
+        if Preferences.shared.autoTilingEnabled { sourceTab.splitRoot.rebalanced() }
+
+        if sourceProjectID != destProjectID {
+            pane.rebind(projectID: destProjectID)
+        }
+        let newTab = TerminalTab(id: UUID(), splitRoot: .pane(pane), focusedPaneID: pane.id)
+        dest.adoptTab(newTab, at: index)
+        activeProjectID = destProjectID
+        recordProjectVisit(destProjectID)
+        saveWorkspaces()
+    }
+
+    /// Find the workspace tab currently holding a pane. Scans every loaded
+    /// workspace — a sidebar pane drop only carries the pane's id, and the
+    /// quick terminal's ephemeral tab (not in `workspaces`) correctly misses.
+    private func locatePane(_ paneID: UUID) -> (projectID: UUID, tab: TerminalTab)? {
+        for (projectID, ws) in workspaces {
+            if let tab = ws.tabs.first(where: { $0.splitRoot.findPane(id: paneID) != nil }) {
+                return (projectID, tab)
+            }
+        }
+        return nil
+    }
+
     /// Reorder a tab within its own project to an absolute drop index (the
     /// offset a sidebar drag-and-drop reports). Persists on a real move.
     func reorderTab(_ tabID: UUID, inProject projectID: UUID, toIndex destination: Int) {
@@ -1165,7 +1285,11 @@ final class AppState {
         logger.info("applyLayout: project=\(project.name, privacy: .public)")
         let layout: LayoutFile
         do {
-            guard let file = try projectFiles.loadFull(forProjectPath: project.path) else {
+            guard let file = try projectFiles.loadFull(
+                forProjectPath: project.path,
+                preferredSlug: ProjectSlug.slug(from: project.name)
+            )
+            else {
                 return LayoutFileError.noProjectFile(projectPath: project.path)
             }
             guard let bridged = file.layoutFile else {
@@ -1197,26 +1321,20 @@ final class AppState {
     /// `pendingLayoutError` (the alert in `MactermApp`). The shared entry
     /// point for the palette/menu command and the first-open auto-apply.
     ///
-    /// When no central file declares the project's path but a committed
-    /// legacy `.macterm/layout.yaml` exists, it's imported first (deprecated
-    /// seed, #114). Explicit apply needs this as much as first open does:
-    /// an existing project always has a restored snapshot, so first-open
-    /// never fires for it — without this, its legacy file would be
-    /// unreachable for the whole deprecation window.
-    func applyLayoutPresentingError(_ project: Project) {
-        if projectFiles.find(forProjectPath: project.path) == nil,
-           LayoutFile.exists(atProjectRoot: project.path)
-        {
-            do {
-                try importLegacyLayout(project)
-            } catch {
-                logger.error("Legacy layout import failed: \(error, privacy: .public)")
-                pendingLayoutError = LayoutError(verb: "import", message: error.localizedDescription)
-                return
-            }
-        }
+    /// `confirming` marks the *user-invoked* command (palette, menu, keybind),
+    /// which gets a success toast. The first-open seed passes false: it fires
+    /// unbidden on every project's first open, where a confirmation would be
+    /// noise for something the user never asked for.
+    func applyLayoutPresentingError(_ project: Project, confirming: Bool = false) {
         if let error = applyLayout(project: project) {
             pendingLayoutError = LayoutError(verb: "apply", message: error.localizedDescription)
+            return
+        }
+        // A destructive plan is staged, not applied — its confirmation dialog is
+        // up, and the toast belongs to whatever the user chooses there
+        // (`confirmPendingLayoutApply`), not to merely opening the prompt.
+        if confirming, pendingLayoutApply == nil {
+            presentToast("Layout applied")
         }
     }
 
@@ -1224,6 +1342,9 @@ final class AppState {
         guard let pending = pendingLayoutApply else { return }
         pendingLayoutApply = nil
         executeLayoutPlan(pending.plan, projectID: pending.projectID)
+        // Always user-invoked: reaching here means they clicked through the
+        // destructive-apply confirmation.
+        presentToast("Layout applied")
     }
 
     func cancelPendingLayoutApply() {
@@ -1234,18 +1355,51 @@ final class AppState {
     /// the two ways a project file ever changes (the other is the user's own
     /// editor). Creates the file when none declares this path yet; realigns
     /// the filename to the current name slug when it drifted.
+    /// `siblingProjects` is the full project list, used only to detect another
+    /// project that shares this directory and filename slug (and would thus
+    /// share the same layout file). AppState doesn't own the `ProjectStore`, so
+    /// callers pass it; the default empty list keeps the shared-path check
+    /// inert for callers that don't have it (and for tests that don't care).
     @discardableResult
-    func saveLayout(project: Project) -> Error? {
+    func saveLayout(project: Project, siblingProjects: [Project] = []) -> Error? {
         logger.info("saveLayout: project=\(project.name, privacy: .public)")
         guard let ws = workspaces[project.id] else { return nil }
+        // Reserve the *other* same-directory projects' files so the save leaves
+        // them alone. Drop our own slug: a same-*name* sibling shares our slug
+        // and thus our file (last save wins — flagged below), so it must not
+        // reserve that file away from us.
+        let ownSlug = ProjectSlug.slug(from: project.name)
+        let reservedSlugs = sameDirectorySiblingSlugs(of: project, in: siblingProjects).subtracting([ownSlug])
         do {
             let layout = LayoutSerializer.layout(for: ws, projectName: project.name, projectRoot: project.path)
             let target = try projectFiles.write(
                 ProjectFile(name: project.name, path: project.path, zmxPath: project.zmxPath, tabs: layout.tabs),
-                projectName: project.name
+                projectName: project.name,
+                reservedSlugs: reservedSlugs
             )
             logger.info("saveLayout succeeded: tabs=\(ws.tabs.count, privacy: .public)")
-            presentSaveConflictIfNeeded(project: project, savedTo: target)
+            // This is the app writing a project file — an open Projects
+            // settings pane must re-read the directory or it shows the
+            // pre-save state.
+            noteLayoutFilesChanged()
+            // A stray-*file* conflict (an unrelated file declares this path)
+            // takes priority over the shared-*project* notice — both write
+            // `pendingLayoutError`, so only surface the latter when the former
+            // stayed quiet.
+            if !presentSaveConflictIfNeeded(project: project, savedTo: target, siblingProjects: siblingProjects) {
+                presentSharedPathConflictIfNeeded(project: project, savedTo: target, siblingProjects: siblingProjects)
+            }
+            // Confirm the clean save only. Either conflict check above raises a
+            // dialog that says the file landed *and* what's wrong with it — a
+            // cheerful "Layout saved" stacked on top would undercut it.
+            //
+            // The subtitle is the full path, home-contracted: the projects
+            // directory isn't somewhere the user necessarily has in mind, so a
+            // bare filename doesn't tell them where to go look. `~` keeps it
+            // readable (and keeps the username out of a screenshot).
+            if pendingLayoutError == nil {
+                presentToast("Layout saved", subtitle: ProjectPath.homeContracted(target.path))
+            }
             return nil
         } catch {
             logger.error("saveLayout failed: \(error, privacy: .public)")
@@ -1253,36 +1407,74 @@ final class AppState {
         }
     }
 
-    /// A save that lands next to *other* files declaring the same path gets a
-    /// visible notice, not just a log line: filename order decides which file
-    /// `find` picks, so a duplicate (hand-authored, or an old file whose
-    /// realign-delete failed) can silently shadow what was just saved.
-    private func presentSaveConflictIfNeeded(project: Project, savedTo target: URL) {
-        let matches = projectFiles.matches(forProjectPath: project.path)
-        guard matches.count > 1 else { return }
-        let winner = matches[0].url
-        // Compare by filename: names are unique within the directory, and the
-        // URLs come from different constructions (`appendingPathComponent` vs
-        // a directory listing) that need not compare equal for the same file.
-        let message = if winner.lastPathComponent != target.lastPathComponent {
-            "The layout was saved to “\(target.lastPathComponent)”, but “\(winner.lastPathComponent)” "
-                + "also declares this project’s path and takes precedence. "
-                + "Remove or merge the duplicate in the projects directory."
-        } else {
-            "Duplicate files also declare this project’s path and are ignored: "
-                + matches.dropFirst().map { "“\($0.url.lastPathComponent)”" }.joined(separator: ", ")
-                + ". The layout was saved to “\(target.lastPathComponent)”."
+    /// Slugs of the *other* projects that back `project`'s directory — the
+    /// layout files that are theirs, not this project's. Lets a save leave a
+    /// sibling's file alone, and tells a sibling's legitimate file apart from a
+    /// stray duplicate.
+    private func sameDirectorySiblingSlugs(of project: Project, in siblingProjects: [Project]) -> Set<String> {
+        Set(
+            siblingProjects
+                .filter { $0.id != project.id && ProjectPath.matches($0.path, project.path) }
+                .map { ProjectSlug.slug(from: $0.name) }
+        )
+    }
+
+    /// A save that lands next to *stray* files declaring the same path — ones
+    /// that are neither this project's own file nor a sibling project's — gets
+    /// a visible notice. The slug-preferring lookup ignores such strays (a
+    /// hand-authored copy, or an old file whose realign-delete failed), so warn
+    /// they exist rather than let them rot silently.
+    @discardableResult
+    private func presentSaveConflictIfNeeded(project: Project, savedTo target: URL, siblingProjects: [Project]) -> Bool {
+        let siblingSlugs = sameDirectorySiblingSlugs(of: project, in: siblingProjects)
+        let strays = projectFiles.matches(forProjectPath: project.path).filter { file in
+            let name = file.url.lastPathComponent
+            // The file we just wrote is not in conflict with itself, and a
+            // sibling project's own file is expected, not a stray.
+            guard name != target.lastPathComponent else { return false }
+            return !siblingSlugs.contains { ProjectSlug.owns(filename: name, slug: $0) }
         }
+        guard !strays.isEmpty else { return false }
+        let names = strays.map { "“\($0.url.lastPathComponent)”" }.joined(separator: ", ")
         pendingLayoutError = LayoutError(
             verb: "save",
-            message: message,
+            message: "The layout was saved to “\(target.lastPathComponent)”, but these other files also "
+                + "declare this project’s path and are ignored: \(names). "
+                + "Remove or merge them in the projects directory.",
             customTitle: "Layout saved with a conflict"
+        )
+        return true
+    }
+
+    /// A directory can back several projects, and a project's layout file is
+    /// keyed by path **and** name-slug — so a same-path project whose name
+    /// yields the *same* slug writes to the very file this save just wrote, and
+    /// the last save silently wins. Flag exactly that pair: same canonical path
+    /// AND same slug. Same path but distinct names is fine — those resolve to
+    /// distinct slug files (`api.yaml` / `api-staging.yaml`) that load
+    /// independently and never overwrite each other.
+    private func presentSharedPathConflictIfNeeded(project: Project, savedTo target: URL, siblingProjects: [Project]) {
+        let slug = ProjectSlug.slug(from: project.name)
+        let colliding = siblingProjects.filter {
+            $0.id != project.id
+                && ProjectPath.matches($0.path, project.path)
+                && ProjectSlug.slug(from: $0.name) == slug
+        }
+        guard !colliding.isEmpty else { return }
+        let names = colliding.map { "“\($0.name)”" }.joined(separator: ", ")
+        pendingLayoutError = LayoutError(
+            verb: "save",
+            message: "\(names) share this directory and layout file "
+                + "“\(target.lastPathComponent)” with this project. Saving here overwrote their "
+                + "layout, and each save wins over the last. Give the projects distinct names to "
+                + "keep separate layout files.",
+            customTitle: "Layout file shared with another project"
         )
     }
 
     /// `saveLayout` + error presentation, mirroring `applyLayoutPresentingError`.
-    func saveLayoutPresentingError(_ project: Project) {
-        if let error = saveLayout(project: project) {
+    func saveLayoutPresentingError(_ project: Project, siblingProjects: [Project] = []) {
+        if let error = saveLayout(project: project, siblingProjects: siblingProjects) {
             pendingLayoutError = LayoutError(verb: "save", message: error.localizedDescription)
         }
     }
@@ -1360,6 +1552,30 @@ final class AppState {
             pane.adaptiveBackgroundColor != color
         else { return }
         pane.adaptiveBackgroundColor = color
+    }
+
+    /// Begin the sidebar rename flow for the tab containing `paneID` — the
+    /// ghostty `prompt_surface_title` keybind's Macterm mapping (titles live
+    /// on tabs here, not surfaces). No-op for panes outside any workspace
+    /// (the quick terminal has no tab UI to rename).
+    func renameTab(containing paneID: UUID, projectID: UUID) {
+        guard let tab = workspaces[projectID]?.tabs.first(where: { $0.splitRoot.contains(paneID: paneID) })
+        else { return }
+        sidebarVisible = true
+        let tabID = tab.id
+        // Defer a tick so the sidebar row's TextField exists before it's asked
+        // to begin editing — same reason as the Rename Tab command.
+        DispatchQueue.main.async { self.renamingTabID = tabID }
+    }
+
+    /// Set (or, with nil, clear) the custom title of the tab containing
+    /// `paneID` — the ghostty `set_tab_title` keybind's Macterm mapping,
+    /// writing the same field the sidebar rename edits.
+    func setTabTitle(containing paneID: UUID, projectID: UUID, title: String?) {
+        guard let tab = workspaces[projectID]?.tabs.first(where: { $0.splitRoot.contains(paneID: paneID) })
+        else { return }
+        tab.customTitle = title
+        saveWorkspaces()
     }
 
     func navigateToPane(_ paneID: UUID, projectID: UUID) {
@@ -1481,12 +1697,10 @@ final class AppState {
         projectID: UUID,
         saveImmediately: Bool = true
     ) -> Bool {
-        // The sidebar shows the *entire* active tab as idle (displayState masks
-        // `.done` for the tab the user is looking at), so every pane in that tab
-        // must actually be cleared — not just the focused one. Otherwise a
-        // non-focused split pane that finished a command stays `.done` under the
-        // hood, gets persisted, and reappears as a checkmark after restart even
-        // though the user saw an empty circle.
+        // Looking at the active tab acknowledges completion for the whole tab,
+        // not only its focused pane. Otherwise a non-focused split pane that
+        // finished a command stays `.done` under the hood, gets persisted, and
+        // reappears as a status dot after the user switches away or restarts.
         // Route through the injected `isAppActive` seam (not `NSApp.isActive`
         // directly): NSApp is nil during construction and unset in tests, and
         // this path is reachable from init via pollNow().

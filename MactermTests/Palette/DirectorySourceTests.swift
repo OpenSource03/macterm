@@ -62,6 +62,66 @@ struct DirectorySourceTests {
     }
 
     @Test
+    func local_directory_backing_a_project_also_offers_adding_another() throws {
+        // A directory is not an identity — below "Switch to project" the
+        // exact match offers creating a second, independent project there.
+        let (ctx, state, store) = makeContext()
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("macterm-dir-source-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let existing = Project(name: "existing", path: dir.path, sortOrder: 0)
+        store.add(existing)
+
+        let items = DirectorySource().items(query: dir.path, context: ctx)
+        #expect(items.first?.subtitle?.contains("Switch to project") == true)
+        let addAnother = try #require(items.first { $0.subtitle?.contains("Add another project") == true })
+        // Ranked directly below the switch row, above any child listing.
+        #expect(addAnother.score == 1)
+        addAnother.action()
+
+        #expect(store.projects.count == 2)
+        let created = try #require(store.projects.last)
+        #expect(created.id != existing.id)
+        #expect(created.path == dir.path)
+        #expect(state.activeProjectID == created.id)
+    }
+
+    @Test
+    func children_backing_projects_also_offer_add_another_rows() throws {
+        // A project-backed child completion pairs switch + add-another just
+        // like the exact typed path — a partially-typed prefix must not
+        // strand the user with switch-only (adding a second project would
+        // otherwise require typing the full path). Unbacked children stay
+        // single rows.
+        let (ctx, _, store) = makeContext()
+        let dir = try makeListingDir(children: ["alpha", "beta"])
+        defer { try? FileManager.default.removeItem(at: dir) }
+        store.add(Project(name: "alpha", path: dir.appendingPathComponent("alpha").path, sortOrder: 0))
+
+        let items = DirectorySource().items(query: dir.path + "/", context: ctx)
+        let switchIdx = try #require(items.firstIndex { $0.subtitle?.contains("Switch to project") == true })
+        let addIdx = try #require(items.firstIndex { $0.subtitle?.contains("Add another project") == true })
+        // The pair is adjacent, switch first; beta (unbacked) stays single.
+        #expect(addIdx == switchIdx + 1)
+        #expect(items.count(where: { $0.title == "beta" }) == 1)
+        #expect(items.count(where: { $0.subtitle?.contains("Add another project") == true }) == 1)
+    }
+
+    @Test
+    func partial_prefix_narrowing_to_a_backed_child_offers_both_actions() throws {
+        // The reported case: `~/dev/ma` narrowing to a single project-backed
+        // `macterm` child must offer add-another, not switch-only.
+        let (ctx, _, store) = makeContext()
+        let dir = try makeListingDir(children: ["alpha", "beta"])
+        defer { try? FileManager.default.removeItem(at: dir) }
+        store.add(Project(name: "alpha", path: dir.appendingPathComponent("alpha").path, sortOrder: 0))
+
+        let items = DirectorySource().items(query: dir.path + "/al", context: ctx)
+        #expect(items.contains { $0.subtitle?.contains("Switch to project") == true })
+        #expect(items.contains { $0.subtitle?.contains("Add another project") == true })
+    }
+
+    @Test
     func typed_remote_spec_offers_add_as_remote_project() throws {
         let (ctx, state, store) = makeContext()
         let items = DirectorySource().items(query: "devbox:~/dev/api", context: ctx)
@@ -92,6 +152,25 @@ struct DirectorySourceTests {
     }
 
     @Test
+    func typed_remote_spec_backing_a_project_also_offers_adding_another() throws {
+        let (ctx, state, store) = makeContext()
+        let existing = Project(name: "api box", path: "devbox:~/dev/api", sortOrder: 0)
+        store.add(existing)
+
+        let items = DirectorySource().items(query: "devbox:~/dev/api", context: ctx)
+        let addAnother = try #require(items.first { $0.subtitle?.contains("Add another project") == true })
+        #expect(addAnother.title == "api")
+        addAnother.action()
+
+        #expect(store.projects.count == 2)
+        let created = try #require(store.projects.last)
+        #expect(created.id != existing.id)
+        #expect(created.path == "devbox:~/dev/api")
+        #expect(created.isRemote)
+        #expect(state.activeProjectID == created.id)
+    }
+
+    @Test
     func bare_home_spec_names_the_project_after_the_host() throws {
         let (ctx, _, _) = makeContext()
         let item = try #require(DirectorySource().items(query: "devbox:~", context: ctx).first)
@@ -114,12 +193,15 @@ struct DirectorySourceTests {
         return dir
     }
 
-    /// The child rows a query returns. Excludes the exact-match row that a
+    /// The child rows a query returns. Excludes the exact-match rows that a
     /// trailing-slash directory query surfaces at the top for the directory
-    /// itself — that row alone has `score == 0`; children score `offset + 1`.
+    /// itself — identified by the item id's path (ids embed the full path),
+    /// not by score, which is a plain running counter.
     private func childTitles(_ query: String, in ctx: PaletteContext) -> [String] {
-        DirectorySource().items(query: query, context: ctx)
-            .filter { $0.score > 0 }
+        let expanded = (query as NSString).expandingTildeInPath
+        let exact = expanded.hasSuffix("/") ? String(expanded.dropLast()) : expanded
+        return DirectorySource().items(query: query, context: ctx)
+            .filter { !$0.id.hasSuffix(":\(exact)") }
             .map(\.title)
     }
 

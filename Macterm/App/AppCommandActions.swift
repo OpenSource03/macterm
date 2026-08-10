@@ -50,6 +50,29 @@ extension AppCommand {
                 // responder. Applies to every caller (palette, menu, hotkey).
                 DispatchQueue.main.async { ctx.appState.renamingTabID = tabID }
             }
+        case .separateAllPanes:
+            // The palette/keybind form of the tab context menu's "Separate
+            // Panes": every pane of the active tab after the first opens in
+            // its own tab, shells intact. nil (hidden/fall-through) on a
+            // single-pane tab — there is nothing to separate.
+            guard let projectID,
+                  let tab = ctx.appState.workspaces[projectID]?.activeTab,
+                  tab.splitRoot.allPanes().count > 1
+            else { return nil }
+            return { ctx.appState.separateTabPanes(tab.id, projectID: projectID) }
+        case .separateCurrentPane:
+            // Split just the focused pane out of the active tab into its own
+            // tab, landing right after the source tab (mirroring where
+            // "Separate All Panes" puts them). Same single-pane guard.
+            guard let projectID, let current,
+                  let ws = ctx.appState.workspaces[projectID],
+                  let tab = ws.activeTab,
+                  tab.splitRoot.allPanes().count > 1,
+                  let paneID = tab.focusedPaneID
+            else { return nil }
+            let destPath = current.path
+            let index = ws.tabs.firstIndex(where: { $0.id == tab.id }).map { $0 + 1 }
+            return { ctx.appState.separatePane(paneID, toProject: projectID, destPath: destPath, at: index) }
         case .splitRight:
             guard let projectID else { return nil }
             return { ctx.appState.splitPane(direction: .horizontal, projectID: projectID) }
@@ -140,25 +163,19 @@ extension AppCommand {
             // Requires an applicable central file. `.invalid` stays enabled on
             // purpose: invoking it surfaces the parse-error dialog instead of
             // failing silently. `.none`/`.emptyTabs` disable the menu item and
-            // mute the palette row (see `paletteDisabledHint`) — except that a
-            // committed legacy `.macterm/layout.yaml` keeps `.none` enabled:
-            // invoking it imports the file into the central directory, then
-            // applies (deprecated seed, #114 — an existing project's snapshot
-            // suppresses the first-open import, so this is its only way in).
+            // mute the palette row (see `paletteDisabledHint`).
             guard let current else { return nil }
-            switch ctx.appState.projectFiles.applyState(forProjectPath: current.path) {
+            switch ctx.appState.projectFiles.applyState(forProjectPath: current.path, preferredSlug: ProjectSlug.slug(from: current.name)) {
             case .applicable,
                  .invalid:
-                return { ctx.appState.applyLayoutPresentingError(current) }
-            case .none:
-                guard LayoutFile.exists(atProjectRoot: current.path) else { return nil }
-                return { ctx.appState.applyLayoutPresentingError(current) }
-            case .emptyTabs:
+                return { ctx.appState.applyLayoutPresentingError(current, confirming: true) }
+            case .emptyTabs,
+                 .none:
                 return nil
             }
         case .saveLayout:
             guard let current else { return nil }
-            return { ctx.appState.saveLayoutPresentingError(current) }
+            return { ctx.appState.saveLayoutPresentingError(current, siblingProjects: ctx.projectStore.projects) }
         case .nextProject:
             return { ctx.appState.selectNextProject(projects: ctx.projectStore.projects) }
         case .previousProject:
@@ -170,7 +187,10 @@ extension AppCommand {
         case .toggleCommandPalette:
             return { ctx.appState.isCommandPaletteVisible.toggle() }
         case .reloadGhosttyConfig:
-            return { GhosttyApp.shared.reloadAndReport() }
+            return {
+                guard GhosttyApp.shared.reloadAndReport() else { return }
+                ctx.appState.presentToast("Ghostty config reloaded")
+            }
         case .toggleQuickTerminal:
             return { QuickTerminalService.shared.toggle() }
         case .checkForUpdate:
@@ -195,11 +215,8 @@ extension AppCommand {
               let projectID = ctx.appState.activeProjectID,
               let current = ctx.projectStore.projects.first(where: { $0.id == projectID })
         else { return nil }
-        switch ctx.appState.projectFiles.applyState(forProjectPath: current.path) {
+        switch ctx.appState.projectFiles.applyState(forProjectPath: current.path, preferredSlug: ProjectSlug.slug(from: current.name)) {
         case .none:
-            // A legacy `.macterm/layout.yaml` keeps the command enabled
-            // (import-then-apply), so no hint for it.
-            guard !LayoutFile.exists(atProjectRoot: current.path) else { return nil }
             return "No project file for this project — use “Save Layout” to create one"
         case .emptyTabs:
             return "The project file declares no tabs"
@@ -210,18 +227,22 @@ extension AppCommand {
     }
 
     /// Secondary line for an *enabled* palette row. Only "Apply Layout" uses
-    /// it: when duplicate files declare the active project's path, filename
-    /// order silently picks one — say which, so a hand-authored duplicate
-    /// doesn't read as "my edits don't apply".
+    /// it: when several files that are *this project's own* (its slug owns the
+    /// filename) declare its path, the lookup picks one — say which, so a
+    /// hand-authored duplicate doesn't read as "my edits don't apply". A
+    /// sibling project's file on the same directory is not a duplicate and is
+    /// left out.
     @MainActor
     func paletteSubtitle(in ctx: AppCommandContext) -> String? {
         guard self == .applyLayout,
               let projectID = ctx.appState.activeProjectID,
               let current = ctx.projectStore.projects.first(where: { $0.id == projectID })
         else { return nil }
-        let matches = ctx.appState.projectFiles.matches(forProjectPath: current.path)
-        guard matches.count > 1 else { return nil }
-        let ignored = matches.dropFirst().map(\.url.lastPathComponent).joined(separator: ", ")
-        return "Using \(matches[0].url.lastPathComponent) — ignoring duplicate \(ignored)"
+        let slug = ProjectSlug.slug(from: current.name)
+        let mine = ctx.appState.projectFiles.matches(forProjectPath: current.path)
+            .filter { ProjectSlug.owns(filename: $0.url.lastPathComponent, slug: slug) }
+        guard mine.count > 1 else { return nil }
+        let ignored = mine.dropFirst().map(\.url.lastPathComponent).joined(separator: ", ")
+        return "Using \(mine[0].url.lastPathComponent) — ignoring duplicate \(ignored)"
     }
 }

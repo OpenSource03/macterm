@@ -11,6 +11,14 @@ struct MactermApp: App {
     @State
     private var projectStore = ProjectStore()
 
+    init() {
+        // Must precede any scene construction: SwiftUI can touch
+        // `GhosttyApp.shared` while building views, and every environment
+        // mutation has to land before `ghostty_init` captures environ.
+        // See EnvironmentSetup for the full contract.
+        EnvironmentSetup.runOnce()
+    }
+
     var body: some Scene {
         WindowGroup {
             MainWindow()
@@ -230,6 +238,79 @@ struct MactermApp: App {
 
         Settings {
             SettingsView()
+                // The Projects pane drives real project/layout mutations, so
+                // the settings window needs the same state the main window has
+                // — and its own copies of the confirmation/error alerts, since
+                // the ones above are attached to `MainWindow` and would fire
+                // behind (or without) the settings window.
+                .environment(appState)
+                .environment(projectStore)
+                .modifier(AppColorScheme())
+                .alert(
+                    "Unload project with running processes?",
+                    isPresented: Binding(
+                        get: { appState.pendingUnloadProject != nil },
+                        set: { if !$0 { appState.cancelPendingUnloadProject() } }
+                    )
+                ) {
+                    Button("Cancel", role: .cancel) {
+                        appState.cancelPendingUnloadProject()
+                    }
+                    Button("Unload", role: .destructive) {
+                        appState.confirmPendingUnloadProject()
+                    }
+                } message: {
+                    Text("A process is still running in this project. Unloading stops every process in its tabs; the layout is kept.")
+                }
+                .alert(
+                    "Remove project with running processes?",
+                    isPresented: Binding(
+                        get: { appState.pendingRemoveProject != nil },
+                        set: { if !$0 { appState.cancelPendingRemoveProject() } }
+                    )
+                ) {
+                    Button("Cancel", role: .cancel) {
+                        appState.cancelPendingRemoveProject()
+                    }
+                    Button("Remove", role: .destructive) {
+                        appState.confirmPendingRemoveProject()
+                    }
+                } message: {
+                    Text("A process is still running in this project. Removing it ends every process in its tabs.")
+                }
+                .alert(
+                    "Apply layout?",
+                    isPresented: Binding(
+                        get: { appState.pendingLayoutApply != nil },
+                        set: { if !$0 { appState.cancelPendingLayoutApply() } }
+                    )
+                ) {
+                    Button("Cancel", role: .cancel) {
+                        appState.cancelPendingLayoutApply()
+                    }
+                    Button("Apply", role: .destructive) {
+                        appState.confirmPendingLayoutApply()
+                    }
+                } message: {
+                    if let pending = appState.pendingLayoutApply {
+                        Text(pending.confirmationMessage)
+                    }
+                }
+                .alert(
+                    appState.pendingLayoutError?.title ?? "Couldn't apply layout",
+                    isPresented: Binding(
+                        get: { appState.pendingLayoutError != nil },
+                        set: { if !$0 { appState.pendingLayoutError = nil } }
+                    )
+                ) {
+                    Button("OK", role: .cancel) {
+                        appState.pendingLayoutError = nil
+                    }
+                } message: {
+                    if let pending = appState.pendingLayoutError {
+                        Text(pending.message)
+                    }
+                }
         }
     }
 }
@@ -278,7 +359,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let controlServer = ControlSocketServer(socketPath: ControlSocketServer.defaultSocketPath())
     private var controlHandler: ControlHandler?
 
+    func applicationWillFinishLaunching(_: Notification) {
+        // The terminal window's identity is "the first window to become main"
+        // (see reopenIfNeeded and MainAppResponder's key-window gate). That
+        // observation must start HERE, not in applicationDidFinishLaunching:
+        // on a LaunchServices launch (Dock, Finder, `open`) AppKit makes the
+        // window main BEFORE applicationDidFinishLaunching runs, so an
+        // observer installed there misses it and `mainWindow` stays nil.
+        // The next window the user mains then gets adopted as "the terminal
+        // window" — typically Settings — after which every hotkey gate
+        // misfires (Cmd+W closes the window, Cmd+D goes dead) and
+        // reopenIfNeeded re-fronts the hidden Settings window on each app
+        // activation. A direct-exec launch (running the binary from a shell)
+        // reverses the order, which is why the bug only surfaced sometimes.
+        // No XCTest skip: the observer is inert without the rest of the
+        // launch path, and AppDelegateTests drives it directly.
+        windowObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didBecomeMainNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            let window = note.object as? NSWindow
+            MainActor.assumeIsolated {
+                guard let self, let window else { return }
+                // Settings (and other auxiliary windows) also become main —
+                // only the first window to do so is the terminal window. The
+                // responder must track that same pointer; assigning `window`
+                // unconditionally handed it the Settings window whenever
+                // Settings was frontmost, defeating its key-window gate.
+                // The first window to become main is the terminal window;
+                // cache that pointer as the authoritative identity. Do NOT
+                // stamp `window.identifier` — this is a SwiftUI `WindowGroup`
+                // window, and forcing an identifier on it interferes with
+                // SwiftUI's own window management (it can recreate the window,
+                // nilling the responder's weak `mainWindow` and breaking the
+                // key-window gate that guards every hotkey).
+                if self.mainWindow == nil { self.mainWindow = window }
+                self.mainAppResponder?.mainWindow = self.mainWindow
+            }
+        }
+    }
+
     func applicationDidFinishLaunching(_: Notification) {
+        // Log-only and cheap, so installed even when hosting tests (before the
+        // xctest early-return below): an uncaught ObjC exception otherwise
+        // kills the app with its reason redacted and no crash report.
+        ExceptionReporting.install()
         // Skip the heavy launch path when the app is hosting unit tests.
         // Without this, libghostty boots, the key router installs, etc. —
         // which times out the xctest runner that just wants to load our
@@ -287,22 +413,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil {
             return
         }
-        // Before anything can spawn a surface: a launcher terminal's zmx
-        // session marker must not leak into our panes (see ZmxEnvironment).
-        ZmxEnvironment.scrubInheritedSession()
-        // Control socket for the bundled `macterm` CLI. Started before any
-        // surface spawns so every shell inherits MACTERM_SOCKET and the
-        // bundled CLI on PATH (setenv mutates this process's environ, which
-        // libghostty passes to spawned shells). Requests get a `starting`
-        // error until installResponders attaches the handler.
+        // MACTERM_SOCKET, PATH, and the zmx-session scrub moved to
+        // EnvironmentSetup (run from MactermApp.init): environ must not be
+        // mutated after ghostty_init captures it, and SwiftUI can trigger
+        // GhosttyApp.shared before this method runs. Binding the socket
+        // itself can stay here — only the env var needed to move. Requests
+        // get a `starting` error until installResponders attaches the
+        // handler.
         controlServer.start()
-        setenv(ControlProtocol.socketEnvVar, controlServer.path, 1)
-        if let binDir = Bundle.main.resourceURL?.appendingPathComponent("bin", isDirectory: true).path,
-           FileManager.default.isExecutableFile(atPath: binDir + "/macterm")
-        {
-            let existingPath = ProcessInfo.processInfo.environment["PATH"] ?? ""
-            setenv("PATH", existingPath.isEmpty ? binDir : "\(binDir):\(existingPath)", 1)
-        }
         UNUserNotificationCenter.current().delegate = NotificationHandler.shared
         if BenchmarkControl.isEnabled {
             // Under the CI benchmark, the notification-permission alert would
@@ -353,31 +471,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 queue: .main
             ) { _ in MainActor.assumeIsolated { GhosttyApp.shared.setAppFocus(false) } },
         ]
-
-        windowObserver = NotificationCenter.default.addObserver(
-            forName: NSWindow.didBecomeMainNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] note in
-            let window = note.object as? NSWindow
-            MainActor.assumeIsolated {
-                guard let self, let window else { return }
-                // Settings (and other auxiliary windows) also become main —
-                // only the first window to do so is the terminal window. The
-                // responder must track that same pointer; assigning `window`
-                // unconditionally handed it the Settings window whenever
-                // Settings was frontmost, defeating its key-window gate.
-                // The first window to become main is the terminal window;
-                // cache that pointer as the authoritative identity. Do NOT
-                // stamp `window.identifier` — this is a SwiftUI `WindowGroup`
-                // window, and forcing an identifier on it interferes with
-                // SwiftUI's own window management (it can recreate the window,
-                // nilling the responder's weak `mainWindow` and breaking the
-                // key-window gate that guards every hotkey).
-                if self.mainWindow == nil { self.mainWindow = window }
-                self.mainAppResponder?.mainWindow = self.mainWindow
-            }
-        }
     }
 
     /// Called from MactermApp.onAppear once the state objects exist. Registers
@@ -413,47 +506,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_: Notification) {
         controlServer.stop()
         onTerminate?()
-        // Quit is a DETACH by default: workspace panes' sessions survive and
+        // Quit is always a DETACH: workspace panes' sessions survive and
         // reattach on relaunch (the snapshot saved by onTerminate carries each
         // pane's session identity). Quick-terminal sessions are ephemeral —
-        // never persisted — so they're always killed; leaving them would only
-        // feed the next launch's reaper. The terminate-on-quit setting opts
-        // into killing everything. Kills block briefly so they land before
+        // never persisted — so they're the only ones killed here; leaving them
+        // would only feed the next launch's reaper. Those are local, so no
+        // remote sweep is needed. The kills block briefly so they land before
         // the process exits (a detached Task is never scheduled during
         // teardown), bounded by ZmxClient's timeouts.
-        var names = QuickTerminalService.shared.splitState.tab.splitRoot.allPanes().map(\.sessionName)
-        var remoteKills: [ZmxClient.RemoteKill] = []
-        if Preferences.shared.terminateSessionsOnQuit {
-            for pane in (appState?.workspaces.values ?? [:].values)
-                .flatMap(\.tabs)
-                .flatMap({ $0.splitRoot.allPanes() })
-            {
-                // "Kill everything" includes remote sessions — routed over
-                // ssh; a local kill of a remote name would silently no-op
-                // and strand the session running on the host.
-                if let remote = ProjectPath.remote(from: pane.projectPath) {
-                    remoteKills.append(.init(
-                        remote: remote, sessionID: pane.sessionName, zmxPath: pane.remoteZmxPath
-                    ))
-                } else {
-                    names.append(pane.sessionName)
-                }
-            }
-        }
+        let names = QuickTerminalService.shared.splitState.tab.splitRoot.allPanes().map(\.sessionName)
         (appState?.zmx ?? .live).killSessionsBlocking(names)
-        (appState?.zmx ?? .live).killRemoteSessionsBlocking(remoteKills)
     }
 
     func applicationShouldTerminate(_: NSApplication) -> NSApplication.TerminateReply {
         // Silent quit when persistence is active: workspace sessions detach
         // and reattach next launch, so there's nothing to confirm for them.
-        // The full prompt returns when the user opted into terminate-on-quit,
-        // or when zmx is unavailable (sessions genuinely die with the app).
-        // Quick-terminal sessions are ephemeral and die on every quit, so a
-        // busy quick-terminal pane still confirms even on a silent quit —
-        // the confirmation follows the destruction.
+        // The full prompt returns only when zmx is unavailable (sessions
+        // genuinely die with the app). Quick-terminal sessions are ephemeral
+        // and die on every quit, so a busy quick-terminal pane still confirms
+        // even on a silent quit — the confirmation follows the destruction.
         let persistenceActive = (appState?.zmx ?? .live).isBundled()
-            && !Preferences.shared.terminateSessionsOnQuit
         if persistenceActive {
             let qtRows = collectQuickTerminalRows()
             if qtRows.isEmpty || QuitConfirmation.runModal(rows: qtRows) {

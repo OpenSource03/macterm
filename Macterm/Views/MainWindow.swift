@@ -13,14 +13,32 @@ struct MainWindow: View {
     private var columnVisibility: NavigationSplitViewVisibility = .automatic
     @State
     private var detailWidth: CGFloat = .infinity
+    @State
+    private var preferences = Preferences.shared
 
     var body: some View {
         // Derive bindings to the @Observable AppState via @Bindable (the
         // Observation-era idiom) rather than a hand-rolled Binding(get:set:).
         @Bindable var appState = appState
+        // Read in body, not inside the toolbar builder, so the Observation
+        // dependency is registered and a Settings change re-places the item.
+        let switcherPosition = preferences.tabSwitcherPosition
+        // Hiding the window toolbar (#226) also drops the titlebar itself,
+        // traffic lights included — that's AppKit's behavior for a toolbar-less
+        // fullSizeContentView window, not something we do separately. Read in
+        // body so flipping the setting re-applies live.
+        let chromeHidden = preferences.hideTitleBar
         return NavigationSplitView(columnVisibility: $columnVisibility) {
             SidebarContent()
+                // Breathing room for the first row once the chrome is gone.
+                // Innermost, before `ignoresSafeArea`, so the padding insets
+                // the rows while the sidebar surface still reaches the edge.
+                .safeAreaPadding(.top, chromeHidden ? 8 : 0)
                 .navigationSplitViewColumnWidth(min: 140, ideal: 180, max: 280)
+                // Hiding the toolbar removes the chrome but SwiftUI keeps its
+                // titlebar safe-area inset reserved; ignoring it is what lets
+                // rows actually start at the window's top edge.
+                .ignoresSafeArea(chromeHidden ? .container : [], edges: .top)
         } detail: {
             ZStack {
                 // The window's NSWindow.backgroundColor (set by WindowAppearance)
@@ -40,6 +58,9 @@ struct MainWindow: View {
                     WelcomeView()
                 }
             }
+            // Same safe-area reclaim as the sidebar: without it the terminal
+            // keeps a blank strip where the hidden titlebar used to be.
+            .ignoresSafeArea(chromeHidden ? .container : [], edges: .top)
             .navigationTitle(activeProject?.name ?? appDisplayName)
             .navigationSubtitle(activeTabTitle)
             .onGeometryChange(for: CGFloat.self) { proxy in
@@ -51,16 +72,34 @@ struct MainWindow: View {
                 ToolbarItem(placement: .primaryAction) {
                     UpdateAvailableToolbarButton()
                 }
-                ToolbarItem(placement: .primaryAction) {
-                    TabSwitcherToolbarItem(availableWidth: detailWidth)
+                // Structural branch, not a placement ternary: each side is its
+                // own toolbar item identity, so flipping the preference tears
+                // down and re-places the control instead of relying on AppKit
+                // migrating an existing item between toolbar slots.
+                if switcherPosition == .leading {
+                    // `.navigation` is the leading slot — AppKit puts it ahead
+                    // of the inline window title, next to the sidebar (#186).
+                    ToolbarItem(placement: .navigation) {
+                        TabSwitcherToolbarItem(availableWidth: detailWidth)
+                    }
+                } else {
+                    ToolbarItem(placement: .primaryAction) {
+                        TabSwitcherToolbarItem(availableWidth: detailWidth)
+                    }
                 }
             }
         }
-        .background(WindowStyler())
+        .toolbar(chromeHidden ? .hidden : .visible, for: .windowToolbar)
+        .background(WindowStyler(hideTitle: chromeHidden))
         .overlay {
             if appState.isCommandPaletteVisible {
                 CommandPaletteOverlay()
             }
+        }
+        // Above the palette overlay so a toast fired by a palette command isn't
+        // covered by the palette's own dismissal animation.
+        .overlay {
+            ToastOverlay()
         }
         .sheet(isPresented: $appState.isNewRemoteProjectSheetPresented) {
             NewRemoteProjectSheet()
@@ -111,6 +150,17 @@ struct MainWindow: View {
 }
 
 struct WelcomeView: View {
+    @State
+    private var preferences = Preferences.shared
+
+    /// Reads `hotkeyVersion` so a rebind refreshes the label. Bindings live in
+    /// raw defaults keys, so the `HotkeyRegistry` read alone is invisible to
+    /// SwiftUI and the hint would otherwise show the launch-time shortcut.
+    private func shortcutLabel(for action: HotkeyAction) -> String {
+        _ = preferences.hotkeyVersion
+        return HotkeyRegistry.displayString(for: HotkeyRegistry.selectedShortcutString(for: action))
+    }
+
     private var shortcuts: [(HotkeyAction, String)] {
         [
             (.openProject, "Open a project"),
@@ -139,7 +189,7 @@ struct WelcomeView: View {
                             .font(.system(size: 12))
                             .foregroundStyle(MactermTheme.fgMuted)
                             .frame(width: 160, alignment: .leading)
-                        Text(HotkeyRegistry.displayString(for: HotkeyRegistry.selectedShortcutString(for: action)))
+                        Text(shortcutLabel(for: action))
                             .font(.system(size: 11, design: .monospaced))
                             .foregroundStyle(MactermTheme.fgDim)
                     }
@@ -156,6 +206,15 @@ struct WelcomeView: View {
 
 struct EmptyProjectView: View {
     let project: Project
+
+    @State
+    private var preferences = Preferences.shared
+
+    /// See `WelcomeView.shortcutLabel` — same rebind-observability need.
+    private func shortcutLabel(for action: HotkeyAction) -> String {
+        _ = preferences.hotkeyVersion
+        return HotkeyRegistry.displayString(for: HotkeyRegistry.selectedShortcutString(for: action))
+    }
 
     private var shortcuts: [(HotkeyAction, String)] {
         [
@@ -187,7 +246,7 @@ struct EmptyProjectView: View {
                             .font(.system(size: 12))
                             .foregroundStyle(MactermTheme.fgMuted)
                             .frame(width: 160, alignment: .leading)
-                        Text(HotkeyRegistry.displayString(for: HotkeyRegistry.selectedShortcutString(for: action)))
+                        Text(shortcutLabel(for: action))
                             .font(.system(size: 11, design: .monospaced))
                             .foregroundStyle(MactermTheme.fgDim)
                     }
@@ -206,6 +265,14 @@ struct WorkspaceView: View {
     let project: Project
     @Environment(AppState.self)
     private var appState
+    /// The pane currently dragged by its grab handle, bubbled up via
+    /// `DraggingPaneKey` so the dragged pane's own leaf drops its target.
+    @State
+    private var draggedPaneID: UUID?
+    /// The live drop resolution shared by the per-leaf pane targets and the
+    /// workspace-level tab target; the workspace overlay renders its preview.
+    @State
+    private var dropResolution: TabDropResolution?
 
     var body: some View {
         if let ws = appState.workspaces[project.id], let tab = ws.activeTab {
@@ -234,13 +301,44 @@ struct WorkspaceView: View {
                     appState.setAdaptiveBackgroundColor(color, paneID: paneID, projectID: project.id)
                 },
                 onToggleZoom: { tab.toggleZoom(paneID: $0) },
-                onMovePane: { source, destination, zone in
-                    if tab.movePane(source, onto: destination, zone: zone) {
-                        appState.saveWorkspaces()
+                paneDrop: PaneDropContext(
+                    root: renderedNode,
+                    resolution: $dropResolution,
+                    draggedPaneID: draggedPaneID,
+                    renderedTabID: tab.id,
+                    onMovePane: { paneID, target in
+                        if tab.movePane(paneID, to: target) {
+                            appState.saveWorkspaces()
+                        }
+                    },
+                    onMergeTab: { movable, target in
+                        appState.mergeTab(
+                            movable.tabID,
+                            from: movable.sourceProjectID,
+                            at: target,
+                            inProject: project.id
+                        )
                     }
-                }
+                )
             )
             .id(renderedNode.id)
+            // Pane grab-handle drags and sidebar tab drags are both captured
+            // per leaf (see LeafDropDelegate for why there is no whole-area
+            // target), sharing one resolution rendered here (#227). Uses
+            // `renderedNode`, not `tab.splitRoot`: while zoomed the user sees
+            // one pane, so a drop should read as a local split of it, not of
+            // the hidden layout.
+            .overlay {
+                WorkspaceDropPreview(resolution: dropResolution)
+            }
+            .onPreferenceChange(DraggingPaneKey.self) { value in
+                MainActor.assumeIsolated {
+                    draggedPaneID = value
+                    // A drag that ended without a valid drop leaves no exited
+                    // event behind; clear any stray preview.
+                    if value == nil { dropResolution = nil }
+                }
+            }
             .overlay(alignment: .topTrailing) {
                 if tab.zoomedPaneID != nil {
                     ZoomIndicator(onExit: { appState.toggleZoom(projectID: project.id) })
@@ -283,6 +381,11 @@ struct ZoomIndicator: View {
 }
 
 private struct WindowStyler: NSViewRepresentable {
+    /// Mirrors `Preferences.hideTitleBar`. The toolbar hide is SwiftUI-side
+    /// (`.toolbar(.hidden, for: .windowToolbar)` in `MainWindow`); the title
+    /// text is an `NSWindow` property, so it's applied here.
+    var hideTitle: Bool = false
+
     func makeCoordinator() -> Coordinator {
         Coordinator()
     }
@@ -316,6 +419,7 @@ private struct WindowStyler: NSViewRepresentable {
             // Without this the titlebar floats above the sidebar with a
             // visible boundary, which is jarring when both are translucent.
             window.styleMask.insert(.fullSizeContentView)
+            window.titleVisibility = hideTitle ? .hidden : .visible
             WindowAppearance.sync(window: window)
             coordinator.observe(window: window)
             // Intercept the close button to hide instead of close,
@@ -324,7 +428,16 @@ private struct WindowStyler: NSViewRepresentable {
         }
     }
 
-    func updateNSView(_: NSView, context _: Context) {}
+    func updateNSView(_ view: NSView, context _: Context) {
+        // Follow live setting flips. Async because SwiftUI forbids window
+        // mutation from inside the update pass.
+        let hide = hideTitle
+        DispatchQueue.main.async {
+            guard let window = view.window else { return }
+            window.titleVisibility = hide ? .hidden : .visible
+            WindowAppearance.syncTitleBarHidden(window: window)
+        }
+    }
 
     final class Coordinator: NSObject, NSWindowDelegate {
         nonisolated(unsafe) private var observer: Any?

@@ -52,6 +52,17 @@ final class GhosttyApp {
     private var themeColorsCache: (version: Int, colors: ThemeResolver.Colors?)?
 
     private init() {
+        // ghostty_init captures `environ` as a pointer+length slice for the
+        // life of the process (surface spawns read it; no C API re-syncs it).
+        // Any setenv/unsetenv after that capture leaves the slice dangling —
+        // observed as a startup crash in the spawn path. App-level env
+        // mutation lives in EnvironmentSetup, which must already have run;
+        // resolveResources() below also setenvs, deliberately before the
+        // ghostty_init call on this same path.
+        precondition(
+            EnvironmentSetup.didRun,
+            "EnvironmentSetup.runOnce() must precede ghostty_init — environ is captured here"
+        )
         systemScheme = Self.readSystemScheme()
         resolveResources()
         guard ghostty_init(UInt(CommandLine.argc), CommandLine.unsafeArgv) == GHOSTTY_SUCCESS else {
@@ -238,9 +249,15 @@ final class GhosttyApp {
     }
 
     /// Reload and surface any user-visible errors (missing file, parse errors)
-    /// as a modal alert. Silent on success. Used by both the Settings reload
-    /// button and the rebindable "Reload Ghostty config" hotkey.
-    func reloadAndReport() {
+    /// as a modal alert. Used by both the Settings reload button and the
+    /// rebindable "Reload Ghostty config" hotkey.
+    ///
+    /// Returns whether the reload was clean. A successful reload is invisible
+    /// unless the config happened to change a color, so the command path uses
+    /// this to confirm with a toast; Settings ignores it (its own window is
+    /// front, and an alert already covers the failure case).
+    @discardableResult
+    func reloadAndReport() -> Bool {
         let result = reloadConfig()
         var lines: [String] = []
         if let missing = result.missingUserConfigPath {
@@ -249,7 +266,7 @@ final class GhosttyApp {
         if !result.diagnostics.isEmpty {
             lines.append(contentsOf: result.diagnostics)
         }
-        guard !lines.isEmpty else { return }
+        guard !lines.isEmpty else { return true }
 
         let alert = NSAlert()
         alert.messageText =
@@ -260,6 +277,7 @@ final class GhosttyApp {
         alert.alertStyle = result.missingUserConfigPath != nil ? .warning : .informational
         alert.addButton(withTitle: "OK")
         alert.runModal()
+        return false
     }
 
     /// Color accessors prefer the colors libghostty resolved for a live surface
@@ -327,6 +345,66 @@ final class GhosttyApp {
         var str = ghostty_string_s()
         guard ghostty_config_get(config, &str, key, UInt(key.utf8.count)), let ptr = str.ptr else { return nil }
         return String(bytes: UnsafeRawBufferPointer(start: ptr, count: Int(str.len)), encoding: .utf8)
+    }
+
+    private func configBool(_ key: String, default defaultValue: Bool) -> Bool {
+        guard let config else { return defaultValue }
+        var value = defaultValue
+        guard ghostty_config_get(config, &value, key, UInt(key.utf8.count)) else { return defaultValue }
+        return value
+    }
+
+    // MARK: - Bell & secure input config (read by GhosttyCallbacks)
+
+    /// The user's `bell-features` set. Same bit layout as Ghostty.app's
+    /// `BellFeatures`; `title` and `border` exist in the config but Macterm
+    /// implements only the app-level features (see `GhosttyCallbacks`'s
+    /// `RING_BELL` case).
+    struct BellFeatures: OptionSet {
+        let rawValue: CUnsignedInt
+        static let system = BellFeatures(rawValue: 1 << 0)
+        static let audio = BellFeatures(rawValue: 1 << 1)
+        static let attention = BellFeatures(rawValue: 1 << 2)
+        static let title = BellFeatures(rawValue: 1 << 3)
+        static let border = BellFeatures(rawValue: 1 << 4)
+    }
+
+    var bellFeatures: BellFeatures {
+        guard let config else { return [] }
+        var raw: CUnsignedInt = 0
+        let key = "bell-features"
+        guard ghostty_config_get(config, &raw, key, UInt(key.utf8.count)) else { return [] }
+        return BellFeatures(rawValue: raw)
+    }
+
+    /// Absolute path of the user's `bell-audio-path`, or nil when unset.
+    var bellAudioPath: String? {
+        guard let config else { return nil }
+        var value = ghostty_config_path_s()
+        let key = "bell-audio-path"
+        guard ghostty_config_get(config, &value, key, UInt(key.utf8.count)), let ptr = value.path else { return nil }
+        let path = String(cString: ptr)
+        return path.isEmpty ? nil : path
+    }
+
+    var bellAudioVolume: Float {
+        guard let config else { return 0.5 }
+        var value = 0.5
+        let key = "bell-audio-volume"
+        _ = ghostty_config_get(config, &value, key, UInt(key.utf8.count))
+        return Float(value)
+    }
+
+    /// `macos-auto-secure-input`: gate for enabling secure keyboard input
+    /// automatically while a surface reports a password prompt.
+    var autoSecureInput: Bool {
+        configBool("macos-auto-secure-input", default: true)
+    }
+
+    /// `macos-secure-input-indication`: whether to show the per-pane lock
+    /// badge while secure input is active.
+    var secureInputIndication: Bool {
+        configBool("macos-secure-input-indication", default: true)
     }
 
     private func loadConfig() -> (ghostty_config_t?, ReloadResult) {

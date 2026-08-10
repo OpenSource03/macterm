@@ -62,6 +62,7 @@ final class ControlHandler {
         case "tab.list": return try tabList(args)
         case "tab.new": return try tabNew(args)
         case "tab.select": return try tabSelect(args)
+        case "tab.move": return try tabMove(args)
         case "tab.close": return try tabClose(args)
         case "pane.list": return try paneList(args)
         case "pane.inspect": return try paneInspect(args)
@@ -75,6 +76,8 @@ final class ControlHandler {
         case "pane.resize-split": return try paneResizeSplit(args)
         #if DEBUG
         case "pane.resize": return try paneResize(args)
+        case "pane.move": return try paneMove(args)
+        case "tab.merge": return try tabMerge(args)
         #endif
         case "grid": return try grid(args)
         case "session.list": return try await sessionList()
@@ -273,7 +276,11 @@ final class ControlHandler {
             throw ControlError(code: .notFound, message: "no directory at \(canonical)")
         }
 
-        let project = projectStore.findOrCreate(
+        // Always create — `project create` is not idempotent: re-running adds a
+        // distinct project for the same directory. `--select` only activates
+        // the just-created project; scripts that want create-or-select must
+        // check `project list` first.
+        let project = projectStore.create(
             name: args.name ?? (canonical as NSString).lastPathComponent,
             path: canonical
         )
@@ -315,6 +322,35 @@ final class ControlHandler {
         let (index, tab) = try resolveTab(args, in: workspace)
         appState.selectTab(tab.id, projectID: project.id)
         return ControlData(tabs: [tabInfo(tab, index: index, in: workspace)])
+    }
+
+    /// Reorder a tab within its project to an absolute slot (#224). `slot` is
+    /// the tab's FINAL 1-based position — `tab move tab:4 2` makes it second —
+    /// which `Workspace.moveTab` doesn't speak: it takes a drag-and-drop
+    /// insertion offset in the pre-removal coordinate space, where a drop past
+    /// the origin lands one slot earlier. So a downward move passes `slot`
+    /// (final position + the removed tab's own vacated slot) and any other
+    /// passes `slot - 1` (0-based conversion only).
+    private func tabMove(_ args: ControlArgs) throws -> ControlData {
+        guard args.tab != nil else {
+            throw ControlError(code: .badRequest, message: "tab.move requires a tab selector")
+        }
+        guard let slot = args.slot else {
+            throw ControlError(code: .badRequest, message: "tab.move requires a destination slot")
+        }
+        let (project, workspace) = try resolveWorkspace(args)
+        let (fromIndex, tab) = try resolveTab(args, in: workspace)
+        // Reject out-of-range slots up front so the caller isn't silently
+        // clamped — same contract as pane.resize-split's ratio bounds.
+        guard slot >= 1, slot <= workspace.tabs.count else {
+            throw ControlError(
+                code: .badRequest,
+                message: "slot must be between 1 and \(workspace.tabs.count)",
+                action: "run `macterm tab list` for the current order"
+            )
+        }
+        appState.reorderTab(tab.id, inProject: project.id, toIndex: slot > fromIndex ? slot : slot - 1)
+        return ControlData(tabs: [tabInfo(tab, index: slot, in: workspace)])
     }
 
     private func tabClose(_ args: ControlArgs) throws -> ControlData {
@@ -368,10 +404,37 @@ final class ControlHandler {
     private func paneFocus(_ args: ControlArgs) throws -> ControlData {
         let (project, workspace) = try resolveWorkspace(args)
         let target = try resolvePane(args, in: workspace)
+        // With a direction the resolved pane is the ORIGIN, not the
+        // destination: move to its nearest neighbour that way. Same
+        // `nearestPane` primitive the focus keybinds use, so a CLI move and a
+        // keybind move can't pick different panes.
+        var pane = target.pane
+        if let raw = args.direction {
+            let direction: PaneFocusDirection
+            switch raw {
+            case "left": direction = .left
+            case "down": direction = .down
+            case "up": direction = .up
+            case "right": direction = .right
+            default:
+                throw ControlError(code: .badRequest, message: "direction must be left, down, up, or right")
+            }
+            // No neighbour that way is a successful no-op, NOT an error. The
+            // caller is typically a program that already failed to move within
+            // its own splits (a vim-tmux-navigator-style keymap) and is asking
+            // whether Macterm can go further; at the outermost edge the answer
+            // is simply "no". Returning the unchanged pane lets the caller see
+            // that by comparing the reported session against its own.
+            if let neighbour = target.tab.splitRoot.nearestPane(from: pane.id, direction: direction),
+               let resolved = target.tab.splitRoot.findPane(id: neighbour)
+            {
+                pane = resolved
+            }
+        }
         // navigateToPane selects the containing tab, fronts the window, and
         // restores first responder — everything "focus" means for a human.
-        appState.navigateToPane(target.pane.id, projectID: project.id)
-        return ControlData(panes: [paneInfo(target.pane, in: target.tab, workspace: workspace)])
+        appState.navigateToPane(pane.id, projectID: project.id)
+        return ControlData(panes: [paneInfo(pane, in: target.tab, workspace: workspace)])
     }
 
     private func paneClose(_ args: ControlArgs) throws -> ControlData {
@@ -506,6 +569,80 @@ final class ControlHandler {
         }
         return ControlData(panes: [paneInfo(target.pane, in: target.tab, workspace: workspace)])
     }
+
+    /// DEBUG-ONLY (#227): drive `TerminalTab.movePane(to:)` — the grab-handle
+    /// drag-and-drop reshape — headlessly, so reorders can be reproduced and
+    /// regression-tested without a mouse. `dest` targets a pane in the same
+    /// tab (a local `.pane` drop); omitting it moves to the workspace edge on
+    /// the `zone` side (a `.rootEdge` drop).
+    private func paneMove(_ args: ControlArgs) throws -> ControlData {
+        let zone: PaneDropZone
+        switch args.zone {
+        case "left": zone = .left
+        case "right": zone = .right
+        case "top": zone = .top
+        case "bottom": zone = .bottom
+        default:
+            throw ControlError(code: .badRequest, message: "pane.move requires a zone: left, right, top, or bottom")
+        }
+        let (_, workspace) = try resolveWorkspace(args)
+        let source = try resolvePane(args, in: workspace)
+        let target: TabDropResolution.Target
+        if let destSelector = args.dest, !destSelector.isEmpty {
+            var destArgs = args
+            destArgs.pane = destSelector
+            destArgs.session = nil
+            let dest = try resolvePane(destArgs, in: workspace)
+            guard dest.tab === source.tab else {
+                throw ControlError(code: .badRequest, message: "destination pane must be in the same tab")
+            }
+            target = .pane(dest.pane.id, zone)
+        } else {
+            target = .rootEdge(zone)
+        }
+        guard source.tab.movePane(source.pane.id, to: target) else {
+            throw ControlError(
+                code: .badRequest,
+                message: "move failed: self-target, or the pane is the tab's only one"
+            )
+        }
+        appState.saveWorkspaces()
+        return ControlData(panes: [paneInfo(source.pane, in: source.tab, workspace: workspace)])
+    }
+
+    /// DEBUG-ONLY (#227): drive `AppState.mergeTab(at:)` — the sidebar
+    /// tab-into-workspace drop — headlessly. The source tab (`tab` selector)
+    /// merges into the project's ACTIVE tab at the resolved target: beside
+    /// `dest` (a pane in the active tab) or at the workspace edge.
+    private func tabMerge(_ args: ControlArgs) throws -> ControlData {
+        let zone: PaneDropZone
+        switch args.zone {
+        case "left": zone = .left
+        case "right": zone = .right
+        case "top": zone = .top
+        case "bottom": zone = .bottom
+        default:
+            throw ControlError(code: .badRequest, message: "tab.merge requires a zone: left, right, top, or bottom")
+        }
+        let (project, workspace) = try resolveWorkspace(args)
+        let (_, sourceTab) = try resolveTab(args, in: workspace)
+        let target: TabDropResolution.Target
+        if let destSelector = args.dest, !destSelector.isEmpty {
+            var destArgs = args
+            destArgs.pane = destSelector
+            destArgs.session = nil
+            destArgs.tab = nil
+            let dest = try resolvePane(destArgs, in: workspace)
+            target = .pane(dest.pane.id, zone)
+        } else {
+            target = .rootEdge(zone)
+        }
+        appState.mergeTab(sourceTab.id, from: project.id, at: target, inProject: project.id)
+        guard let active = workspace.activeTab else {
+            throw ControlError(code: .notFound, message: "no active tab after merge")
+        }
+        return ControlData(panes: active.splitRoot.allPanes().map { paneInfo($0, in: active, workspace: workspace) })
+    }
     #endif
 
     private func grid(_ args: ControlArgs) throws -> ControlData {
@@ -560,6 +697,7 @@ final class ControlHandler {
         // dialog must never dangle waiting for a click that won't come.
         if appState.pendingLayoutApply != nil {
             if args.force == true {
+                // Raises its own toast.
                 appState.confirmPendingLayoutApply()
             } else {
                 appState.cancelPendingLayoutApply()
@@ -569,13 +707,19 @@ final class ControlHandler {
                     action: "re-run with --force to apply anyway"
                 )
             }
+        } else {
+            // Non-destructive path applied immediately. The window is on screen
+            // and its panes just changed, so confirm it the same way the
+            // palette command does — `layout save` already toasts, and the two
+            // verbs shouldn't disagree about whether a CLI apply is visible.
+            appState.presentToast("Layout applied")
         }
         return ControlData()
     }
 
     private func layoutSave(_ args: ControlArgs) throws -> ControlData {
         let project = try resolveProject(args.project)
-        if let error = appState.saveLayout(project: project) {
+        if let error = appState.saveLayout(project: project, siblingProjects: projectStore.projects) {
             throw ControlError(code: .internalError, message: error.localizedDescription)
         }
         return ControlData()
@@ -769,8 +913,19 @@ final class ControlHandler {
             title: pane.displayTitle,
             process: pane.foregroundProcessName,
             cwd: pane.nsView?.currentPwd ?? pane.projectPath,
-            focused: tab.id == workspace.activeTabID && pane.id == tab.focusedPaneID
+            focused: tab.id == workspace.activeTabID && pane.id == tab.focusedPaneID,
+            state: controlState(for: pane.executionState)
         )
+    }
+
+    /// Wire representation of `TerminalExecutionState` — a plain string keeps
+    /// the protocol's JSON stable even if the enum's cases are renamed.
+    private func controlState(for state: TerminalExecutionState) -> String {
+        switch state {
+        case .idle: "idle"
+        case .running: "running"
+        case .done: "done"
+        }
     }
 
     private func paneIDsBySessionName() -> [String: String] {
