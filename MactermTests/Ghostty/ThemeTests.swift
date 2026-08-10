@@ -1,7 +1,13 @@
 import AppKit
 @testable import Macterm
+import Observation
 import SwiftUI
 import Testing
+
+@MainActor
+private final class ObservationFlag {
+    var wasInvalidated = false
+}
 
 @MainActor
 struct ThemeTests {
@@ -23,5 +29,29 @@ struct ThemeTests {
         #expect(MactermTheme.nsBg.isVisuallyEqual(to: opposite))
         // …but the scene-level scheme must not.
         #expect(MactermTheme.colorScheme == configScheme)
+    }
+
+    /// Regression: SwiftUI reaches the observable adaptive tint through the
+    /// static `MactermTheme.nsBg` accessor. Keep that dependency intact so a
+    /// tint change invalidates in-window chrome without pretending the user's
+    /// persisted Ghostty configuration changed.
+    @Test
+    func adaptiveTintInvalidatesThemeBackgroundObservation() {
+        let previous = GhosttyApp.shared.adaptiveBackgroundColor
+        let replacement = previous?.isVisuallyEqual(to: .black) == true ? NSColor.white : .black
+        defer { GhosttyApp.shared.adoptAdaptiveBackgroundColor(previous) }
+
+        let flag = ObservationFlag()
+        withObservationTracking {
+            _ = MactermTheme.nsBg
+        } onChange: {
+            MainActor.assumeIsolated {
+                flag.wasInvalidated = true
+            }
+        }
+
+        GhosttyApp.shared.adoptAdaptiveBackgroundColor(replacement)
+
+        #expect(flag.wasInvalidated)
     }
 }

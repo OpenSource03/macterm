@@ -1,4 +1,5 @@
 import AppKit
+import CoreVideo
 @preconcurrency import IOSurface
 @testable import Macterm
 import Testing
@@ -41,7 +42,7 @@ struct AdaptiveTerminalBackgroundTests {
     }
 
     @Test
-    func nearbyRendererValuesShareAQuantizedBucket() throws {
+    func nearbyRendererValuesShareAQuantizedBucketAndReturnASampledColor() throws {
         let first = Array(repeating: pixel(17, 18, 19), count: 35)
         let second = Array(repeating: pixel(20, 21, 22), count: 35)
         let transparent = Array(repeating: pixel(0, 0, 0, 0), count: 30)
@@ -49,9 +50,24 @@ struct AdaptiveTerminalBackgroundTests {
         let match = try #require(
             AdaptiveTerminalBackgroundDetector.dominantColor(in: first + second + transparent)
         )
-        #expect(match.red == 18)
-        #expect(match.green == 19)
-        #expect(match.blue == 20)
+        #expect(match.red == 17)
+        #expect(match.green == 18)
+        #expect(match.blue == 19)
+        #expect(match.coverage == 0.7)
+    }
+
+    @Test
+    func exactModeRepresentsAQuantizedBucket() throws {
+        let lessFrequent = Array(repeating: pixel(17, 18, 19), count: 25)
+        let mode = Array(repeating: pixel(20, 21, 22), count: 45)
+        let transparent = Array(repeating: pixel(0, 0, 0, 0), count: 30)
+
+        let match = try #require(
+            AdaptiveTerminalBackgroundDetector.dominantColor(in: lessFrequent + mode + transparent)
+        )
+        #expect(match.red == 20)
+        #expect(match.green == 21)
+        #expect(match.blue == 22)
         #expect(match.coverage == 0.7)
     }
 
@@ -61,6 +77,7 @@ struct AdaptiveTerminalBackgroundTests {
             kIOSurfaceWidth: NSNumber(value: 40),
             kIOSurfaceHeight: NSNumber(value: 30),
             kIOSurfaceBytesPerElement: NSNumber(value: 4),
+            kIOSurfacePixelFormat: NSNumber(value: kCVPixelFormatType_32BGRA),
         ] as CFDictionary
         guard let surface = IOSurfaceCreate(properties) else {
             Issue.record("Could not create the test IOSurface")
@@ -86,6 +103,33 @@ struct AdaptiveTerminalBackgroundTests {
         #expect(match.green == 21)
         #expect(match.blue == 31)
         #expect(match.coverage == 1)
+    }
+
+    @Test
+    func rejectsIOSurfaceWithUnexpectedPixelFormat() throws {
+        let properties = [
+            kIOSurfaceWidth: NSNumber(value: 40),
+            kIOSurfaceHeight: NSNumber(value: 30),
+            kIOSurfaceBytesPerElement: NSNumber(value: 4),
+            kIOSurfacePixelFormat: NSNumber(value: kCVPixelFormatType_32RGBA),
+        ] as CFDictionary
+        let surface = try #require(IOSurfaceCreate(properties))
+
+        #expect(AdaptiveTerminalBackgroundDetector.dominantColor(in: surface) == nil)
+    }
+
+    @Test
+    func configuredBackgroundIsSuppressedAsAnAdaptiveCandidate() throws {
+        let configured = NSColor(srgbRed: 0.10, green: 0.20, blue: 0.30, alpha: 1)
+        let near = NSColor(srgbRed: 0.11, green: 0.20, blue: 0.30, alpha: 1)
+        let distinct = NSColor(srgbRed: 0.55, green: 0.20, blue: 0.30, alpha: 1)
+
+        #expect(AdaptiveTerminalChrome.effectiveCandidate(nil, configuredBackground: configured) == nil)
+        #expect(AdaptiveTerminalChrome.effectiveCandidate(near, configuredBackground: configured) == nil)
+        let candidate = try #require(
+            AdaptiveTerminalChrome.effectiveCandidate(distinct, configuredBackground: configured)
+        )
+        #expect(candidate.isVisuallyEqual(to: distinct))
     }
 
     @Test
@@ -149,26 +193,5 @@ struct AdaptiveTerminalBackgroundTests {
         // …while a TUI that exited off-screen still clears via two observations.
         #expect(stabilizer.observe(nil) == nil)
         #expect(stabilizer.observe(nil) == .clear)
-    }
-
-    @Test
-    func singlePaneColorTintsTheWindowAndFillsItsOwnPane() throws {
-        let color = NSColor(srgbRed: 0.2, green: 0.3, blue: 0.4, alpha: 1)
-
-        let window = try #require(AdaptiveTerminalBackgroundPresentation.windowColor(for: [color]))
-        #expect(window.isVisuallyEqual(to: color))
-        // The pane fill stays opaque even when the window tint is translucent,
-        // so the padding around the TUI shows no seam.
-        #expect(AdaptiveTerminalBackgroundPresentation.paneColors(for: [color]) == [color])
-    }
-
-    @Test
-    func splitColorsStayInsideTheirOwnPanes() {
-        let grok = NSColor(srgbRed: 0.08, green: 0.09, blue: 0.12, alpha: 1)
-        let paneColors = AdaptiveTerminalBackgroundPresentation.paneColors(for: [grok, nil])
-
-        #expect(AdaptiveTerminalBackgroundPresentation.windowColor(for: [grok, nil]) == nil)
-        #expect(paneColors[0]?.isVisuallyEqual(to: grok) == true)
-        #expect(paneColors[1] == nil)
     }
 }

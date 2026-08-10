@@ -27,6 +27,9 @@ final class GhosttyTerminalNSView: NSView {
     /// For a remote pane the same name identifies the session on the REMOTE
     /// host's daemon instead.
     private let sessionName: String
+    /// Stable identity for view-lifetime coordination. Unlike an object address,
+    /// this cannot be reused when a surface is destroyed and recreated.
+    let paneID: UUID
 
     /// The parsed `[user@]host:dir` spec when this pane belongs to a remote
     /// project (#104); nil for local panes. A remote surface runs
@@ -206,6 +209,7 @@ final class GhosttyTerminalNSView: NSView {
     private var currentKeyEvent: NSEvent?
 
     init(
+        paneID: UUID,
         workingDirectory: String,
         sessionName: String,
         command: String? = nil,
@@ -214,6 +218,7 @@ final class GhosttyTerminalNSView: NSView {
         remoteSpec: ProjectPath? = nil,
         remoteZmxPath: String? = nil
     ) {
+        self.paneID = paneID
         self.workingDirectory = workingDirectory
         self.sessionName = sessionName
         self.command = command

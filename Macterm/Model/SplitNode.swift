@@ -610,6 +610,7 @@ final class Pane: Identifiable {
         var mergedEnv = env ?? [:]
         mergedEnv[ControlProtocol.sessionEnvVar] = sessionName
         let view = GhosttyTerminalNSView(
+            paneID: id,
             workingDirectory: projectPath,
             sessionName: sessionName,
             command: command,

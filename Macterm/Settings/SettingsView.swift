@@ -255,16 +255,6 @@ private struct AppearanceSettings: View {
 
     var body: some View {
         Form {
-            Section("Terminal") {
-                Toggle("Match full-screen app backgrounds", isOn: $adaptiveTerminalChrome)
-                    .onChange(of: adaptiveTerminalChrome) { _, enabled in
-                        Preferences.shared.adaptiveTerminalChromeEnabled = enabled
-                    }
-                Text("Matches the whole window for a single pane; in a split, only each full-screen app's pane changes color.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-            }
-
             Section("Window") {
                 HStack {
                     Text("Background opacity")
@@ -307,6 +297,16 @@ private struct AppearanceSettings: View {
 
                 Text(blurFootnote)
                     .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Terminal") {
+                Toggle("Match terminal app backgrounds", isOn: $adaptiveTerminalChrome)
+                    .onChange(of: adaptiveTerminalChrome) { _, enabled in
+                        Preferences.shared.adaptiveTerminalChromeEnabled = enabled
+                    }
+                Text("Matches the whole window for a single pane; in a split, only each full-screen app's pane changes color.")
+                    .font(.caption)
                     .foregroundStyle(.secondary)
             }
 

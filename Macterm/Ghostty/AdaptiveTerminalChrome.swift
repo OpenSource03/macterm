@@ -3,22 +3,20 @@ import IOSurface
 
 /// Samples every visible pane in the active terminal window and publishes its
 /// temporary terminal-app background. A single pane may tint the whole window;
-/// split panes are always isolated to their own bounds. Sampling follows render
-/// activity plus a low-frequency monitor for static TUIs and costs nothing
-/// until the user enables the feature.
+/// split panes are always isolated to their own bounds. Sampling is event-driven
+/// by render/focus changes, with one short verification sample for inferred
+/// colors; there is no idle polling.
 @MainActor
 final class AdaptiveTerminalChrome {
     static let shared = AdaptiveTerminalChrome()
 
-    private var stabilizers: [ObjectIdentifier: AdaptiveTerminalBackgroundStabilizer] = [:]
+    private var stabilizers: [UUID: AdaptiveTerminalBackgroundStabilizer] = [:]
     private var sampleTimer: Timer?
-    private var monitorTimer: Timer?
     private var verificationTimer: Timer?
 
     private init() {}
 
     func preferenceDidEnable() {
-        startMonitoring()
         scheduleSample(delay: 0)
     }
 
@@ -45,13 +43,11 @@ final class AdaptiveTerminalChrome {
     /// the eligible set when the timer fires, one run-loop turn later.
     func focusDidChange(to _: GhosttyTerminalNSView) {
         guard Preferences.shared.adaptiveTerminalChromeEnabled else { return }
-        startMonitoring()
         scheduleSample(delay: 0)
     }
 
     func terminalDidRender(_ view: GhosttyTerminalNSView) {
         guard shouldHandleEvent(from: view) else { return }
-        startMonitoring()
         scheduleSample(delay: 0.12)
     }
 
@@ -61,15 +57,15 @@ final class AdaptiveTerminalChrome {
     func terminalBackgroundDidChange(_ color: NSColor, in view: GhosttyTerminalNSView) {
         guard shouldHandleEvent(from: view) else { return }
         let candidate = effectiveCandidate(color)
-        var stabilizer = stabilizers[ObjectIdentifier(view)] ?? AdaptiveTerminalBackgroundStabilizer()
+        var stabilizer = stabilizers[view.paneID] ?? AdaptiveTerminalBackgroundStabilizer()
         stabilizer.reset(to: candidate)
-        stabilizers[ObjectIdentifier(view)] = stabilizer
+        stabilizers[view.paneID] = stabilizer
         refreshPresentation(for: monitoredViews())
     }
 
     func terminalBackgroundDidReset(in view: GhosttyTerminalNSView) {
         guard shouldHandleEvent(from: view) else { return }
-        stabilizers[ObjectIdentifier(view)] = AdaptiveTerminalBackgroundStabilizer()
+        stabilizers[view.paneID] = AdaptiveTerminalBackgroundStabilizer()
         view.sampledDominantBackgroundColor = nil
         scheduleSample(delay: 0)
     }
@@ -90,17 +86,6 @@ final class AdaptiveTerminalChrome {
         }
         RunLoop.main.add(timer, forMode: .common)
         sampleTimer = timer
-    }
-
-    private func startMonitoring() {
-        guard monitorTimer == nil else { return }
-        let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated {
-                self?.sampleVisiblePanes()
-            }
-        }
-        RunLoop.main.add(timer, forMode: .common)
-        monitorTimer = timer
     }
 
     private func sampleVisiblePanes() {
@@ -127,7 +112,7 @@ final class AdaptiveTerminalChrome {
     /// Returns true when this pane has a first, unconfirmed inferred
     /// observation and needs the short verification sample.
     private func sample(_ view: GhosttyTerminalNSView) -> Bool {
-        let id = ObjectIdentifier(view)
+        let id = view.paneID
         // A pane returning from an occluded tab keeps its remembered color, so
         // seed the fresh stabilizer with it: re-observing the same color is a
         // no-op instead of a pending change, while a TUI that exited off-screen
@@ -162,13 +147,15 @@ final class AdaptiveTerminalChrome {
 
     private func refreshPresentation(for views: [GhosttyTerminalNSView]) {
         let candidates = views.map(currentCandidate)
-        let paneColors = AdaptiveTerminalBackgroundPresentation.paneColors(for: candidates)
-        for (view, color) in zip(views, paneColors) {
+        // Every detected color fills its pane opaquely, including a lone pane.
+        // The window-wide tint follows window opacity, so without this fill a
+        // translucent seam would remain around the TUI's opaque pixels.
+        for (view, color) in zip(views, candidates) {
             view.presentAdaptivePaneBackground(color)
         }
-        GhosttyApp.shared.adoptAdaptiveBackgroundColor(
-            AdaptiveTerminalBackgroundPresentation.windowColor(for: candidates)
-        )
+        // A lone pane can lend its color to the whole window. In a split, each
+        // color stays pane-local and the configured background owns the chrome.
+        GhosttyApp.shared.adoptAdaptiveBackgroundColor(candidates.count == 1 ? candidates[0] : nil)
     }
 
     private func currentCandidate(for view: GhosttyTerminalNSView) -> NSColor? {
@@ -220,8 +207,16 @@ final class AdaptiveTerminalChrome {
     }
 
     private func effectiveCandidate(_ color: NSColor?) -> NSColor? {
+        Self.effectiveCandidate(color, configuredBackground: GhosttyApp.shared.backgroundColor)
+    }
+
+    static func effectiveCandidate(
+        _ color: NSColor?,
+        configuredBackground: NSColor,
+        minimumDistance: CGFloat = 0.04
+    ) -> NSColor? {
         guard let color else { return nil }
-        return color.distance(to: GhosttyApp.shared.backgroundColor) >= 0.04 ? color : nil
+        return color.distance(to: configuredBackground) >= minimumDistance ? color : nil
     }
 
     /// Drops only the stabilizers of panes that left the monitored set. Their
@@ -229,7 +224,7 @@ final class AdaptiveTerminalChrome {
     /// revisited tab presents its TUI background immediately instead of
     /// flashing the configured theme while detection restarts from zero.
     private func pruneState(keeping views: [GhosttyTerminalNSView]) {
-        let active = Set(views.map(ObjectIdentifier.init))
+        let active = Set(views.map(\.paneID))
         stabilizers = stabilizers.filter { active.contains($0.key) }
     }
 
@@ -241,8 +236,6 @@ final class AdaptiveTerminalChrome {
     private func cancelTimers() {
         sampleTimer?.invalidate()
         sampleTimer = nil
-        monitorTimer?.invalidate()
-        monitorTimer = nil
         verificationTimer?.invalidate()
         verificationTimer = nil
     }
