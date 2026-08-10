@@ -13,6 +13,31 @@ private enum SidebarItem: Hashable {
 /// trailing inset at its root so all of them stop at the same edge.
 private let rowTrailingInset: CGFloat = 10
 
+/// Keeps the sidebar footer above scrolling rows, using the native macOS 26
+/// scroll-edge fade when available.
+private extension View {
+    @ViewBuilder
+    func sidebarSafeAreaBar(
+        isPresented: Bool,
+        @ViewBuilder content: () -> some View
+    ) -> some View {
+        if isPresented {
+            if #available(macOS 26.0, *) {
+                safeAreaBar(edge: .bottom, spacing: 0) {
+                    content()
+                }
+            } else {
+                safeAreaInset(edge: .bottom, spacing: 0) {
+                    content()
+                        .background(MactermTheme.bg)
+                }
+            }
+        } else {
+            self
+        }
+    }
+}
+
 /// In-app drag payload for a sidebar tab row. Carries the tab's identity plus
 /// its source project so a drop can tell a same-project reorder from a
 /// cross-project move. `TerminalTab` itself is a live reference type (owns
@@ -81,33 +106,25 @@ struct SidebarContent: View {
         }
         .listStyle(.sidebar)
         .scrollContentBackground(.hidden)
-        // No background here: the window's NSWindow.backgroundColor (set by
-        // WindowAppearance) provides the translucent fill uniformly. Adding
-        // another tinted layer here would make the sidebar read darker than
-        // the surrounding strip.
-        .safeAreaInset(edge: .bottom) {
-            if showNewProjectButton {
-                VStack(spacing: 0) {
-                    Divider()
-                    HStack(spacing: 0) {
-                        Menu {
-                            Button("Local Folder…") { openProject() }
-                            Button("Remote Machine…") {
-                                appState.isNewRemoteProjectSheetPresented = true
-                            }
-                        } label: {
-                            Label("New Project", systemImage: "plus")
-                                .font(.body)
-                        }
-                        .menuStyle(.borderlessButton)
-                        .menuIndicator(.hidden)
-                        .fixedSize()
-                        Spacer()
+        .sidebarSafeAreaBar(isPresented: showNewProjectButton) {
+            HStack(spacing: 0) {
+                Menu {
+                    Button("Local Folder…") { openProject() }
+                    Button("Remote Machine…") {
+                        appState.isNewRemoteProjectSheetPresented = true
                     }
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 10)
+                } label: {
+                    Label("New Project", systemImage: "plus")
+                        .font(.body)
                 }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                Spacer()
             }
+            .padding(.horizontal, 16)
+            .padding(.top, 36)
+            .padding(.bottom, 10)
         }
         .onChange(of: selection) { _, items in
             // Navigation follows a single selection only. A multi-selection is
