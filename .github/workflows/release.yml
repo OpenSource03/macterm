@@ -17,8 +17,12 @@ jobs:
   # same breath as publishing it and every job reads the STALE value: v1.21.0
   # shipped that way (2026-08-01, run 30699334224) — the release record said
   # `prerelease: false`, the payload said true, so `bump-cask` skipped and the
-  # appcast never got an item. The giveaway was the run's display title, still
-  # showing the pre-edit release name ("Macterm v1.20.11") against tag v1.21.0.
+  # appcast never got an item. Don't expect the old giveaway — the run's display
+  # title showing a pre-edit release name against the real tag ("Macterm v1.20.11"
+  # on tag v1.21.0). It renders LIVE from the release name, so it re-wrote itself
+  # to `v1.21.0` the moment that release was retitled, and release names are now
+  # just the tag anyway, so the two can no longer visibly disagree. What a repeat
+  # looks like today is silent: a skipped `bump-cask` and an appcast with no item.
   #
   # `gh release view` asks the API for current truth, so this is correct no matter
   # which activity type fired or how the release was edited beforehand. Preferred
@@ -171,7 +175,7 @@ jobs:
             exit 1
           fi
           TAG="v${VERSION}"
-          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "Macterm $TAG" --generate-notes
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --generate-notes
           gh release upload "$TAG" dmgs/*.dmg --clobber
           # Ensure the release is published (not left as draft), and re-assert
           # the prerelease flag explicitly: publishing a draft in the same call
