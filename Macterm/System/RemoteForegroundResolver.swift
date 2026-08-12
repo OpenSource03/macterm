@@ -4,15 +4,31 @@ import os
 private let logger = Logger(subsystem: appBundleID, category: "RemoteForegroundResolver")
 
 /// One session's probed remote foreground: the short process name (`comm`,
-/// feeds tab naming) and — when the host's `ps` reported it — the foreground's
-/// full command line (`args`, feeds Save Layout's `run:` capture, the remote
-/// analogue of the local KERN_PROCARGS2 argv).
+/// feeds tab naming), the host's own idle verdict (`isIdle`, feeds the
+/// busy-close policy), and — when the host's `ps` reported it — the
+/// foreground's full command line (`args`, feeds Save Layout's `run:`
+/// capture, the remote analogue of the local KERN_PROCARGS2 argv).
 struct RemoteForeground: Equatable {
     let comm: String
+    /// The host's idle verdict — true when the tty's foreground process
+    /// group IS the session leader's (the shell owns its prompt), judged
+    /// where the processes actually live so no local shell database has to
+    /// recognize a remote-only login shell. nil when the probe couldn't
+    /// compute one (pgid read failure, older wire format) — consumers fall
+    /// back to the local shell-database heuristic.
+    let isIdle: Bool?
     /// The full `ps -o args=` command line, nil when the probe line carried
     /// none. May describe a shell at its prompt — `Pane.applyRemoteForeground`
     /// decides whether it counts as a running command.
     let command: String?
+
+    /// `isIdle` defaults to nil (no host verdict) so name+command call sites
+    /// — tests, the name-only convenience — read unchanged.
+    init(comm: String, isIdle: Bool? = nil, command: String?) {
+        self.comm = comm
+        self.isIdle = isIdle
+        self.command = command
+    }
 }
 
 /// Tier-2 smart tab naming for remote panes (#104): a batched, per-host ssh
@@ -116,20 +132,32 @@ final class RemoteForegroundResolver {
         }
     }
 
-    /// Parse `session<TAB>comm<TAB>args` probe lines into a name → foreground
-    /// map. The args field is optional (older two-field lines, or a `ps` that
-    /// reported nothing) and may itself contain tabs — it's the unsplit
-    /// remainder of the line. Pure.
+    /// Parse `session<TAB>comm<TAB>idleflag<TAB>args` probe lines into a
+    /// name → foreground map. The idle flag is the HOST's own verdict
+    /// (`1` = the session leader's process group owns the tty, i.e. the
+    /// shell sits at its prompt; `0` = some other group holds the
+    /// foreground) — absent or unparseable, it maps to nil and the sampling
+    /// site falls back to the local-database heuristic. The args field is
+    /// optional (a `ps` that reported nothing) and may itself contain tabs
+    /// — it's the unsplit remainder of the line, which is why the
+    /// fixed-width flag sits before it. Two-field lines (degraded probes)
+    /// still parse as name-only. Pure.
     nonisolated static func parseProbeOutput(_ stdout: String) -> [String: RemoteForeground] {
         var map: [String: RemoteForeground] = [:]
         for line in stdout.split(separator: "\n") {
-            let parts = line.split(separator: "\t", maxSplits: 2, omittingEmptySubsequences: false)
+            let parts = line.split(separator: "\t", maxSplits: 3, omittingEmptySubsequences: false)
             guard parts.count >= 2 else { continue }
             let name = parts[0].trimmingCharacters(in: .whitespaces)
             let comm = parts[1].trimmingCharacters(in: .whitespaces)
             guard name.hasPrefix("macterm-"), !comm.isEmpty else { continue }
-            let args = parts.count > 2 ? parts[2].trimmingCharacters(in: .whitespaces) : ""
-            map[name] = RemoteForeground(comm: comm, command: args.isEmpty ? nil : args)
+            let flag = parts.count >= 3 ? parts[2].trimmingCharacters(in: .whitespaces) : ""
+            let isIdle: Bool? = switch flag {
+            case "1": true
+            case "0": false
+            default: nil
+            }
+            let args = parts.count > 3 ? parts[3].trimmingCharacters(in: .whitespaces) : ""
+            map[name] = RemoteForeground(comm: comm, isIdle: isIdle, command: args.isEmpty ? nil : args)
         }
         return map
     }

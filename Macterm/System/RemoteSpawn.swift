@@ -159,10 +159,18 @@ enum RemoteSpawn {
     /// `run:` capture: resolve every `macterm-*` session on the host to its
     /// tty's foreground process — the same session→leader→tpgid→comm pipeline
     /// `ZmxForegroundResolver` runs locally, expressed as portable POSIX sh
-    /// (Linux, BSD, macOS remotes). Emits `session<TAB>comm<TAB>args` lines
-    /// (`args` is the foreground's full command line, the remote analogue of
-    /// the local KERN_PROCARGS2 argv that Save Layout records as `run:`);
-    /// parsed by `RemoteForegroundResolver.parseProbeOutput`.
+    /// (Linux, BSD, macOS remotes). Emits
+    /// `session<TAB>comm<TAB>idleflag<TAB>args` lines; parsed by
+    /// `RemoteForegroundResolver.parseProbeOutput`. The idle flag is the
+    /// HOST's own verdict — `1` when the tty's foreground process group IS
+    /// the session leader's (the shell owns its prompt), `0` when some other
+    /// group holds it — so busyness never depends on the local Mac's shell
+    /// database recognizing a remote-only shell; a failed pgid read emits an
+    /// empty flag, which parses as "unknown" and falls back to the local
+    /// heuristic rather than inventing a verdict. `args` is the foreground's
+    /// full command line (the remote analogue of the local KERN_PROCARGS2
+    /// argv that Save Layout records as `run:`) — it may contain tabs, so it
+    /// is the LAST field, consumed as the unsplit remainder.
     ///
     /// Deliberately contains NO single quotes: it ships to the host wrapped
     /// as `sh -c '<script>'`, and the outer quoting must survive any login
@@ -184,8 +192,13 @@ enum RemoteSpawn {
       [ -n "$t" ] || continue
       c=$(ps -o comm= -p "$t" 2>/dev/null)
       [ -n "$c" ] || continue
+      g=$(ps -o pgid= -p "$p" 2>/dev/null | tr -d " ")
+      i=
+      if [ -n "$g" ]; then
+        if [ "$t" = "$g" ]; then i=1; else i=0; fi
+      fi
       a=$(ps -o args= -p "$t" 2>/dev/null)
-      printf "%s\\t%s\\t%s\\n" "$n" "$c" "$a"
+      printf "%s\\t%s\\t%s\\t%s\\n" "$n" "$c" "$i" "$a"
     done
     """
 
