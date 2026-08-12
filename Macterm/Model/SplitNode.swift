@@ -583,11 +583,74 @@ final class Pane: Identifiable {
             if isRemote, oldValue == .running, programTitle != nil {
                 programTitle = nil
             }
+            // Any execution transition on a remote pane is also a naming
+            // boundary (idle→running: a program took the foreground;
+            // running→ended: the shell owns it again) — request an immediate
+            // probe rather than waiting out the resolver's throttle.
+            if isRemote { remoteProbePending = true }
             // Transitions (idle→running, running→done) are exactly when the
             // adaptive poll should speed up; steady-state assignments and
             // per-frame heartbeats don't reach here (value unchanged).
             NotificationCenter.default.post(name: .terminalPollEvent, object: nil)
         }
+    }
+
+    /// Set when this remote pane crossed an execution boundary and its host
+    /// should be probed immediately, bypassing `RemoteForegroundResolver`'s
+    /// per-host throttle. The remote mirror of the #210 command-boundary
+    /// refresh in `TerminalSurface.onCommandFinished`: local panes re-read
+    /// the process table right there, but `refreshForegroundProcess()`
+    /// no-ops for remote panes (the local table only knows the ssh client),
+    /// so a finished program's name lingered until the next scheduled probe
+    /// — or, with the poll slowed/paused, until the user interacted. The
+    /// resolver consumes the flag when its probe actually fires; while a
+    /// probe is inflight the flag survives, so the request is retried on the
+    /// next tick instead of dropped.
+    @ObservationIgnored
+    private(set) var remoteProbePending = false
+
+    /// Note an execution boundary reported outside the execution tracker —
+    /// the unconditional OSC 133;D hook in `TerminalSurface`, which fires
+    /// even with the status indicator off (when no `executionState` edge
+    /// exists at all). Posts a poll event so a slowed or paused poll wakes
+    /// to fire the probe now.
+    func noteRemoteCommandBoundary() {
+        guard isRemote else { return }
+        remoteProbePending = true
+        NotificationCenter.default.post(name: .terminalPollEvent, object: nil)
+    }
+
+    /// The resolver fired a probe covering this pane's host — the pending
+    /// boundary request is answered.
+    func consumeRemoteProbeRequest() {
+        remoteProbePending = false
+    }
+
+    /// Bounded retries while this pane has never been named: a freshly
+    /// spawned session registers on the host asynchronously (ssh handshake +
+    /// zmx startup, seconds), so the primed init probe usually fires too
+    /// early and finds no session. Consuming that request would strand the
+    /// pane nil forever if its project leaves the frontmost slot inside the
+    /// registration window — the scheduled probes that would otherwise
+    /// retry cover only the frontmost project. The local mirror is
+    /// `AppState.zmxRetryBudget` for `zmx ls` racing session registration.
+    /// Bounded so a session that will never appear (killed remotely) can't
+    /// keep re-arming probes; NOT re-armed on probe failure (unreachable
+    /// host) — retrying can't name a pane the host won't answer for.
+    /// Sixteen because retries pace at roughly max(poll tick, probe RTT)
+    /// ≈ 1–2s (a pending request bypasses the resolver's interval), and
+    /// registration on a slow host measures ~12–14s: the budget must
+    /// outlive the window it exists to cover, with margin.
+    @ObservationIgnored
+    private var remoteProbeRetryBudget = 16
+
+    /// The resolver's probe succeeded but its listing had no entry for this
+    /// pane's session (the registration race above). Re-arm the request,
+    /// bounded, so the retry rides the next poll tick from any project.
+    func noteRemoteProbeMiss() {
+        guard isRemote, foregroundProcessName == nil, remoteProbeRetryBudget > 0 else { return }
+        remoteProbeRetryBudget -= 1
+        remoteProbePending = true
     }
 
     @ObservationIgnored
@@ -1183,6 +1246,15 @@ final class Pane: Identifiable {
         self.env = env
         self.activityQuietPollDelay = activityQuietPollDelay
         executionTracker = TerminalExecutionTracker(hasUserInteraction: command != nil)
+        // Prime the first probe for a remote pane. Scheduled probes cover only
+        // the frontmost project, so without this a restored pane in a
+        // background project is never probed: its name stays nil and
+        // `needsConfirmClose` falls back to the surface's ssh-is-always-busy
+        // reading — every plain-shell close warned until the project was
+        // brought frontmost once. The primed request rides along with any
+        // project's poll tick (and even an occluded window), exactly like a
+        // command-boundary request.
+        remoteProbePending = isRemote
     }
 
     /// Re-point this pane at a new workspace after its tab is moved between
