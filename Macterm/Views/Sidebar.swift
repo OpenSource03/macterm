@@ -70,6 +70,29 @@ extension UTType {
     static let mactermProject = UTType(exportedAs: "com.thdxg.macterm.project-move")
 }
 
+/// Import-side union of the two sidebar drag payloads, so a single view can
+/// accept BOTH drags through ONE `.dropDestination`. This exists because
+/// stacking two `.dropDestination`s (one per payload type) on the same view
+/// is non-deterministic: only one of the two registrations wins, and which
+/// one flips with unrelated view changes — measured live, the project header
+/// accepted project drops in one build and silently rejected them in the
+/// next. Never stack drop destinations; widen the payload instead.
+/// Import-only: drags still lift as `MovableTab`/`MovableProject` (their
+/// `CodableRepresentation` is JSON, which is what the decoders here parse).
+enum SidebarDropItem: Transferable {
+    case tab(MovableTab)
+    case project(MovableProject)
+
+    static var transferRepresentation: some TransferRepresentation {
+        DataRepresentation(importedContentType: .mactermTab) { data in
+            try .tab(JSONDecoder().decode(MovableTab.self, from: data))
+        }
+        DataRepresentation(importedContentType: .mactermProject) { data in
+            try .project(JSONDecoder().decode(MovableProject.self, from: data))
+        }
+    }
+}
+
 struct SidebarContent: View {
     @Environment(AppState.self)
     private var appState
@@ -90,11 +113,26 @@ struct SidebarContent: View {
             ForEach(Array(projectStore.projects.enumerated()), id: \.element.id) { projectIndex, project in
                 projectSection(index: projectIndex, project: project)
             }
-            // No `.onMove`: it puts the List in reorder mode and hijacks the tab
-            // rows' `.draggable`, so tab drag-and-drop never fired. Project
-            // reordering is instead driven by dragging the project header (a
-            // `MovableProject` payload) so both drags share the Transferable
-            // path and coexist. See `projectHeader`.
+            // Project reordering is a `MovableProject` drag from one header
+            // onto another (see `projectHeader`); the context menus' Move
+            // Up/Down are the fallback for precision moves. There is NO
+            // insertion-line path for projects — every native mechanism is
+            // broken at this outline level, each verified live, so don't
+            // re-attempt them:
+            // - `.onMove` puts the List in reorder mode and hijacks the tab
+            //   rows' `.draggable` (tab drag-and-drop never fired).
+            // - `.dropDestination(for:)` on this OUTER ForEach (whose rows
+            //   are DisclosureGroups) AND the legacy `.onInsert(of:)` both
+            //   crash identically on drop inside SwiftUI's outline machinery
+            //   (OutlineListCoordinator.outlineView(_:acceptDrop:…) →
+            //   HeterogeneousCollection.element(at:) assertion; macOS 27).
+            //   The insertion LINE renders fine during the hover — it is the
+            //   accept that dies, so it can't even be risked as a cosmetic.
+            //   The tab ForEach below can use the same API because its rows
+            //   are one level down in the outline.
+            // - A List-level catch-all never fires: the outline view claims
+            //   every drag over the sidebar, so unhandled drops don't bubble
+            //   to enclosing views.
         }
         // A single list-level context menu instead of one per row: the native
         // multi-select menu. Its closure receives the exact set the menu should
@@ -209,6 +247,14 @@ struct SidebarContent: View {
         // payload is just IDs — the live tab is looked up on drop, never
         // serialized.
         .draggable(MovableTab(tabID: tab.id, sourceProjectID: project.id))
+        // Deliberately NO drop destination on tab rows. Any destination here
+        // — even one registered for the project payload alone — claims every
+        // drag over the row before the tab ForEach's insertion mechanism sees
+        // it (SwiftUI routes a drag to the topmost target by geometry with no
+        // type fall-through), which kills the native insertion line and broke
+        // tab reordering outright when tried. The cost is that a PROJECT drag
+        // over an expanded section's tab rows has nothing to land on — drop
+        // it on a project header instead. The insertion line won.
     }
 
     private func projectHeader(index projectIndex: Int, project: Project) -> some View {
@@ -216,26 +262,38 @@ struct SidebarContent: View {
             projectStore.rename(id: project.id, to: $0)
         }
         .padding(.trailing, rowTrailingInset)
+        // Stretch to the full row so the drag grab area (and the drop band in
+        // the background below) covers the whole row, not just the label's
+        // intrinsic width — same treatment as the tab rows.
+        .frame(maxWidth: .infinity, alignment: .leading)
         .tag(SidebarItem.project(project.id))
         // Drag the header to reorder projects (replaces the removed `.onMove`).
         .draggable(MovableProject(projectID: project.id))
-        // Dropping a TAB onto the header appends it to that project — the only
-        // drop path for a collapsed or empty project, whose tab ForEach renders
-        // no rows to target.
-        .dropDestination(for: MovableTab.self) { items, _ in
-            receiveTabDrop(items, into: project, at: nil)
+        // ONE drop destination for both payloads (see `SidebarDropItem` for
+        // why stacking two is a landmine). A TAB dropped here appends to this
+        // project — the only drop path for a collapsed or empty project,
+        // whose tab ForEach renders no rows to target. A PROJECT dropped
+        // squarely on the header reorders it to this project's slot; the
+        // seams BETWEEN rows deliberately stay uncovered (label-height
+        // target, no taller band) so the ForEach-level insertion line can
+        // appear there for both drag kinds.
+        .dropDestination(for: SidebarDropItem.self) { items, _ in
+            for item in items {
+                switch item {
+                case let .tab(tab):
+                    receiveTabDrop([tab], into: project, at: nil)
+                case let .project(dragged):
+                    receiveProjectDrop([dragged], before: project)
+                }
+            }
             return true
         } isTargeted: { targeted in
-            // Spring-open a collapsed project while hovering a drag over it, so
-            // the user can see where the tab will land.
+            // Spring-open a collapsed project while hovering a drag over it,
+            // so the user can see where a tab will land. This also fires for
+            // project drags (the union payload can't be inspected here); the
+            // hovered header itself doesn't move when it expands, so the
+            // drop stays on target.
             if targeted { expandedProjects.insert(project.id) }
-        }
-        // Dropping a PROJECT onto this header reorders it to this project's
-        // slot. Stacked as a second `.dropDestination` because each accepts a
-        // single payload type.
-        .dropDestination(for: MovableProject.self) { items, _ in
-            receiveProjectDrop(items, before: project)
-            return true
         }
     }
 
@@ -268,10 +326,11 @@ struct SidebarContent: View {
         expandedProjects.insert(project.id)
     }
 
-    /// Apply a project drag-and-drop: move the dragged project to the target
-    /// project's slot. Uses `move(fromOffsets:toOffset:)` semantics — `toOffset`
-    /// is the index in the CURRENT array where the item inserts (SwiftUI's
-    /// convention), so a downward move lands after the target.
+    /// Apply a project drag-and-drop onto a section (header or tab row): move
+    /// the dragged project to the target project's slot. Uses
+    /// `move(fromOffsets:toOffset:)` semantics — `toOffset` is the index in
+    /// the CURRENT array where the item inserts (SwiftUI's convention), so a
+    /// downward move lands after the target.
     private func receiveProjectDrop(_ items: [MovableProject], before target: Project) {
         let projects = projectStore.projects
         guard let targetIndex = projects.firstIndex(where: { $0.id == target.id }) else { return }
@@ -347,6 +406,18 @@ struct SidebarContent: View {
         Divider()
         Button("Rename Project") { appState.renamingProjectID = project.id }
         Divider()
+        // Same reorder calls as Settings → Projects' rows; `toOffset` is in
+        // `move(fromOffsets:toOffset:)` convention, hence `+ 2` for down.
+        let index = projectStore.projects.firstIndex(where: { $0.id == project.id }) ?? 0
+        Button("Move Up") {
+            projectStore.reorder(fromOffsets: [index], toOffset: index - 1)
+        }
+        .disabled(index <= 0)
+        Button("Move Down") {
+            projectStore.reorder(fromOffsets: [index], toOffset: index + 2)
+        }
+        .disabled(index >= projectStore.projects.count - 1)
+        Divider()
         Button("Unload Project") { appState.requestUnloadProject(project.id) }
             .disabled(!appState.isProjectLoaded(project.id))
         Button("Remove Project", role: .destructive) {
@@ -362,6 +433,19 @@ struct SidebarContent: View {
             // its own tab, shells intact.
             Button("Separate Panes") { appState.separateTabPanes(tab.id, projectID: project.id) }
         }
+        Divider()
+        // `reorderTab` takes `move(fromOffsets:toOffset:)`-convention offsets
+        // (it's the drag-and-drop path's entry point), hence `+ 2` for down.
+        let tabs = appState.workspaces[project.id]?.tabs ?? []
+        let tabIndex = tabs.firstIndex(where: { $0.id == tab.id }) ?? 0
+        Button("Move Up") {
+            appState.reorderTab(tab.id, inProject: project.id, toIndex: tabIndex - 1)
+        }
+        .disabled(tabIndex <= 0)
+        Button("Move Down") {
+            appState.reorderTab(tab.id, inProject: project.id, toIndex: tabIndex + 2)
+        }
+        .disabled(tabIndex >= tabs.count - 1)
         let moveTargets = projectStore.projects.filter { $0.id != project.id }
         if !moveTargets.isEmpty {
             Menu("Move to Project") {
