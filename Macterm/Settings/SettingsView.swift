@@ -295,31 +295,6 @@ private final class DividerShield: NSView {
     override func mouseUp(with _: NSEvent) {}
 }
 
-private extension NSView {
-    /// First `NSSplitView` at or below this view. The probe sits in a
-    /// `.background` beside the split view rather than inside a column, so the
-    /// search runs down from the window's content view.
-    var firstSplitView: NSSplitView? {
-        if let split = self as? NSSplitView { return split }
-        for subview in subviews {
-            if let found = subview.firstSplitView { return found }
-        }
-        return nil
-    }
-
-    /// The `NSSplitViewController` whose root view this is. A view controller
-    /// inserts itself into its root view's responder chain, so walking up from
-    /// the split view reaches it.
-    var owningSplitViewController: NSSplitViewController? {
-        var responder: NSResponder? = nextResponder
-        while let current = responder {
-            if let controller = current as? NSSplitViewController { return controller }
-            responder = current.nextResponder
-        }
-        return nil
-    }
-}
-
 /// The main window's titlebar chrome, applied to the settings window so the two
 /// match: transparent and separator-less, content extending underneath, and an
 /// empty unified toolbar. Having a toolbar at all is what makes AppKit lay out
@@ -567,6 +542,7 @@ private struct AppearanceSettings: View {
     @State private var tabIconSymbol: String = Preferences.shared.tabIconSymbol
     @State private var showAgentIcons: Bool = Preferences.shared.showAgentIcons
     @State private var showTabStatusIndicator: Bool = Preferences.shared.showTabStatusIndicator
+    @State private var peekSidebarWhenHidden: Bool = Preferences.shared.peekSidebarWhenHidden
     @State private var showNewProjectButton: Bool = Preferences.shared.showNewProjectButton
     @State private var tabSwitcherVisibility: String = Preferences.shared.tabSwitcherVisibility.rawValue
     @State private var tabSwitcherPosition: String = Preferences.shared.tabSwitcherPosition.rawValue
@@ -691,6 +667,11 @@ private struct AppearanceSettings: View {
                 Toggle("Show New Project button", isOn: $showNewProjectButton)
                     .onChange(of: showNewProjectButton) { _, v in Preferences.shared.showNewProjectButton = v }
                 Text("When hidden, create projects via the command palette or context menu.")
+                    .settingsCaption()
+
+                Toggle("Peek sidebar when hidden", isOn: $peekSidebarWhenHidden)
+                    .onChange(of: peekSidebarWhenHidden) { _, v in Preferences.shared.peekSidebarWhenHidden = v }
+                Text("Slides the hidden sidebar out while the pointer rests at the window's left edge.")
                     .settingsCaption()
             }
 

@@ -15,6 +15,55 @@ struct MainWindow: View {
     private var detailWidth: CGFloat = .infinity
     @State
     private var preferences = Preferences.shared
+    /// The sidebar is temporarily out because the pointer is at the leading
+    /// edge, while the user's toggle state still says hidden. Peeking drives
+    /// the same `columnVisibility` path the shortcut uses — never AppKit's
+    /// broken overlay reveal, disabled in `WindowAppearance`.
+    @State
+    private var isPeeking = false
+    /// Set when the shortcut hides the sidebar with the pointer still over it,
+    /// so the next hover event doesn't instantly peek it back out. Cleared
+    /// once the pointer leaves the trigger strip.
+    @State
+    private var suppressPeekUntilExit = false
+    /// Last open sidebar width, read-only mirror for the peek's "pointer left
+    /// the sidebar" threshold — the reopen width itself stays SwiftUI's.
+    @State
+    private var sidebarWidth: CGFloat = 180
+    /// When the running peek expand animation will have settled; a retraction
+    /// requested before this waits (see `endPeek`).
+    @State
+    private var peekExpandSettleTime: Date = .distantPast
+    /// When the running peek collapse animation will have settled; a new peek
+    /// requested before this waits (see `handleSidebarPeekHover`). Besides
+    /// protecting the animation, this closes a delivery race: a peek started
+    /// between our collapse's state write and its `onChange` delivery made the
+    /// handler see `.detailOnly` while `isPeeking` — the toolbar-button-pin
+    /// signature — and wrongly pinned the sidebar, killing the hover.
+    @State
+    private var peekCollapseSettleTime: Date = .distantPast
+    /// A retraction is queued behind the expand animation. Cleared if the
+    /// pointer returns to the sidebar before it fires.
+    @State
+    private var deferredUnpeek = false
+    /// A peek is queued behind the collapse animation (the pointer may be
+    /// parked in the strip, generating no further hover events to retry on).
+    @State
+    private var deferredPeek = false
+    /// Last hover location, for deferred re-checks that fire without a fresh
+    /// event. Cleared when the pointer leaves the window.
+    @State
+    private var lastHoverPoint: CGPoint?
+
+    /// Conservative bound on the column expand/collapse animation, including a
+    /// margin — deferring the opposite transition slightly long is invisible,
+    /// cutting it short reverses the animation mid-flight and corrupts
+    /// NavigationSplitView's stored width metric.
+    private let peekAnimationDuration: TimeInterval = 0.4
+
+    /// Width of the hover strip at the leading edge that pops the hidden
+    /// sidebar out — a little wider than AppKit's own edge-hover band.
+    private let peekStripWidth: CGFloat = 12
 
     var body: some View {
         // Derive bindings to the @Observable AppState via @Bindable (the
@@ -35,6 +84,13 @@ struct MainWindow: View {
                 // the rows while the sidebar surface still reaches the edge.
                 .safeAreaPadding(.top, chromeHidden ? 8 : 0)
                 .navigationSplitViewColumnWidth(min: 140, ideal: 180, max: 280)
+                .onGeometryChange(for: CGFloat.self) { proxy in
+                    proxy.size.width
+                } action: { width in
+                    // Below the column's 140 minimum means mid-collapse; keep
+                    // the last open width for the peek's exit threshold.
+                    if width >= 100 { sidebarWidth = width }
+                }
                 // Hiding the toolbar removes the chrome but SwiftUI keeps its
                 // titlebar safe-area inset reserved; ignoring it is what lets
                 // rows actually start at the window's top edge.
@@ -111,9 +167,51 @@ struct MainWindow: View {
             guard !appState.hasRestoredSelection else { return }
             appState.restoreSelection(projects: projectStore.projects)
         }
+        .onContinuousHover(coordinateSpace: .local) { phase in
+            handleSidebarPeekHover(phase)
+        }
         .onChange(of: appState.sidebarVisible) { _, visible in
+            if visible {
+                // A peek promoted to pinned (toolbar button, shortcut while
+                // peeked): the column is already out, just drop the peek flag.
+                isPeeking = false
+            } else if isPeeking {
+                // Hidden by shortcut while peeked out under the pointer: don't
+                // let the very next hover event pop it straight back open.
+                isPeeking = false
+                suppressPeekUntilExit = true
+            }
+            if !visible {
+                // A shortcut hide collapses the column just like a peek's
+                // retraction; a peek starting into that animation would
+                // reverse it mid-flight (see `beginPeek`).
+                peekCollapseSettleTime = Date().addingTimeInterval(peekAnimationDuration)
+            }
             withAnimation {
                 columnVisibility = visible ? .automatic : .detailOnly
+            }
+        }
+        .onChange(of: columnVisibility) { _, visibility in
+            // The column can move without going through AppState (toolbar
+            // button, drag-out); mirror it back so the toggle shortcut acts on
+            // what's on screen — desynced, it needed two presses to re-hide.
+            // A peek is the exception: the column shows while the user's
+            // toggle state stays hidden.
+            if isPeeking {
+                // The toolbar button honors the sidebar's real configuration
+                // (hidden), not the peeked column it happens to see — so its
+                // collapse means "show": pin the sidebar instead of letting
+                // it vanish. Our own unpeek can't land here (`endPeek` drops
+                // the flag before collapsing).
+                if visibility == .detailOnly {
+                    isPeeking = false
+                    appState.sidebarVisible = true
+                }
+                return
+            }
+            let visible = visibility != .detailOnly
+            if appState.sidebarVisible != visible {
+                appState.sidebarVisible = visible
             }
         }
         .onChange(of: appState.isCommandPaletteVisible) { _, visible in
@@ -127,6 +225,100 @@ struct MainWindow: View {
                 DispatchQueue.main.async { appState.restoreFocusToActivePane() }
             }
         }
+    }
+
+    /// Hover-peek for the hidden sidebar: pointer in the leading-edge strip
+    /// slides it out at its remembered width; pointer off the sidebar (or out
+    /// of the window) slides it back in. Runs through `columnVisibility`, the
+    /// shortcut's path, so the titlebar lays out as for a pinned sidebar.
+    private func handleSidebarPeekHover(_ phase: HoverPhase) {
+        switch phase {
+        case let .active(point):
+            lastHoverPoint = point
+            guard !appState.sidebarVisible else { return }
+            // Toggleable in Settings → Appearance → Sidebar. Checked here, not
+            // at the modifier, so flipping it off mid-peek still retracts.
+            guard preferences.peekSidebarWhenHidden else {
+                if isPeeking { endPeek() }
+                return
+            }
+            if suppressPeekUntilExit {
+                if point.x > peekStripWidth { suppressPeekUntilExit = false }
+                return
+            }
+            if !isPeeking, point.x <= peekStripWidth {
+                beginPeek()
+            } else if isPeeking, point.x > sidebarWidth + 8 {
+                endPeek()
+            } else if isPeeking {
+                // Pointer back over the sidebar: cancel a deferred retraction.
+                deferredUnpeek = false
+            }
+        case .ended:
+            // The pointer left the window entirely.
+            lastHoverPoint = nil
+            deferredPeek = false
+            if isPeeking { endPeek() }
+            suppressPeekUntilExit = false
+        }
+    }
+
+    /// Start the peek — but never by interrupting the collapse animation: a
+    /// too-quick re-entry defers the peek until the collapse has settled, then
+    /// re-checks against the pointer's last known position (it may be parked
+    /// in the strip, generating no further events to retry on).
+    private func beginPeek() {
+        let remaining = peekCollapseSettleTime.timeIntervalSinceNow
+        guard remaining <= 0 else {
+            guard !deferredPeek else { return }
+            deferredPeek = true
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(remaining))
+                guard deferredPeek else { return }
+                deferredPeek = false
+                guard !isPeeking, !appState.sidebarVisible,
+                      preferences.peekSidebarWhenHidden, !suppressPeekUntilExit,
+                      let point = lastHoverPoint, point.x <= peekStripWidth
+                else { return }
+                expandPeek()
+            }
+            return
+        }
+        expandPeek()
+    }
+
+    private func expandPeek() {
+        isPeeking = true
+        deferredPeek = false
+        peekExpandSettleTime = Date().addingTimeInterval(peekAnimationDuration)
+        withAnimation { columnVisibility = .automatic }
+    }
+
+    /// Retract the peek — but never by interrupting the expand animation.
+    /// Collapsing the column mid-expand corrupts NavigationSplitView's stored
+    /// width metric (the sidebar then reopens at the default width, and no
+    /// `ideal` can override a stored metric), so a too-quick exit defers the
+    /// retraction until the expand has settled.
+    private func endPeek() {
+        let remaining = peekExpandSettleTime.timeIntervalSinceNow
+        guard remaining <= 0 else {
+            guard !deferredUnpeek else { return }
+            deferredUnpeek = true
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(remaining))
+                guard deferredUnpeek, isPeeking else { return }
+                collapsePeek()
+            }
+            return
+        }
+        collapsePeek()
+    }
+
+    private func collapsePeek() {
+        isPeeking = false
+        deferredUnpeek = false
+        peekCollapseSettleTime = Date().addingTimeInterval(peekAnimationDuration)
+        withAnimation { columnVisibility = .detailOnly }
     }
 
     private var activeProject: Project? {
