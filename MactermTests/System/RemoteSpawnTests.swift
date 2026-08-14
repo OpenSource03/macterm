@@ -36,6 +36,51 @@ struct RemoteSpawnTests {
     }
 
     @Test
+    func pane_command_settles_term_against_the_hosts_own_terminfo() {
+        // A resolvable TERM is never touched — the outer test is negated, so
+        // the replacement only runs when the arriving TERM has no entry. That
+        // precedence matters: preferring xterm-ghostty whenever the host had it
+        // overrode a user's `SetEnv TERM=xterm-256color` pin and turned a stock
+        // Debian prompt monochrome, since its ~/.bashrc gates color on
+        // `xterm-color|*-256color` — a string match no capability check can
+        // satisfy. Verified against a stubbed `infocmp` across all five cases.
+        //
+        // Decided host-side on purpose: `ghostty +ssh` forces
+        // `-o SetEnv=TERM=xterm-ghostty` from the client because its wrapper has
+        // no remote-side script; ours reads the remote DB directly, so it needs
+        // no cache and works where env requests are dropped.
+        let cmd = RemoteSpawn.paneCommand(remote: remote, sessionName: "macterm-api-abc123") ?? ""
+        #expect(cmd.contains("if ! infocmp \"$TERM\" >/dev/null 2>&1; then "))
+        #expect(cmd.contains("if infocmp xterm-ghostty >/dev/null 2>&1; then TERM=xterm-ghostty;"))
+        #expect(cmd.contains("else TERM=xterm-256color; fi; export TERM; fi;"))
+        // Nested `if`, never `&&`/`||` chaining — the chained form's
+        // left-to-right precedence binds the else-branch wrong.
+        #expect(!RemoteSpawn.remoteTermPreamble.contains("||"))
+        // Pane-only: a background op has no terminal to describe.
+        let op = RemoteSpawn.opArgv(remote: remote, zmxArguments: ["ls"])?.joined(separator: " ") ?? ""
+        #expect(!op.contains("infocmp"))
+    }
+
+    @Test
+    func pane_command_declares_truecolor_host_side() {
+        // A remote pane's surface is libghostty, so 24-bit color is a fact,
+        // but nothing carries it across ssh on its own: TERM rides the pty
+        // request while everything else is an env request the server filters
+        // (a Tailscale SSH host dropped SendEnv AND SetEnv COLORTERM even with
+        // AcceptEnv COLORTERM effective). So the script asserts it itself.
+        // Without this, helix refuses a truecolor theme ("theme requires true
+        // color support") on any host where TERM isn't xterm-ghostty — which
+        // `remoteTermPreamble` can't fix, since it only ever downgrades.
+        let cmd = RemoteSpawn.paneCommand(remote: remote, sessionName: "macterm-api-abc123")
+        #expect(cmd?.contains("COLORTERM=truecolor; export COLORTERM;") == true)
+        // Pane-only: background ops and the naming probe render nothing.
+        let op = RemoteSpawn.opArgv(remote: remote, zmxArguments: ["ls"])?.joined(separator: " ") ?? ""
+        let probe = RemoteSpawn.foregroundProbeArgv(remote: remote)?.joined(separator: " ") ?? ""
+        #expect(!op.contains("COLORTERM"))
+        #expect(!probe.contains("COLORTERM"))
+    }
+
+    @Test
     func remote_scripts_never_source_profiles() {
         // Locked-in decision (#104): profiles are arbitrary code in the
         // pane's critical path. Sourcing them — inline, in a subshell, or
