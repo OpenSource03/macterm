@@ -2,13 +2,22 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
-// Drag-and-drop pane reorganization, following Ghostty's pattern: each pane
-// shows a small grab handle at its top center (revealed while the pointer is
-// in the pane's top band). Dragging the handle starts an `NSDraggingSession`
-// carrying the pane's UUID; every other pane is a drop target split into four
-// triangular edge zones, highlighting the half where the dragged pane will
-// land. The drop is handled by `TerminalTab.movePane` — the `Pane` object
-// (and its live surface) is reused, only the tree is reshaped.
+// Drag-and-drop pane reorganization, following Ghostty's pattern: a pane in a
+// SPLIT tab shows a small grab handle at its top center (revealed while the
+// pointer is in the pane's top band — a lone pane has nowhere to go, so
+// `SplitTreeView` gates the handle on `isSplit`). Dragging it starts an
+// `NSDraggingSession` carrying the pane's UUID, which two different columns
+// can receive:
+//
+// - The workspace, where every other pane is a drop target split into four
+//   triangular edge zones highlighting the half the pane will land in. Handled
+//   by `TerminalTab.movePane`, reshaping the tab's tree.
+// - The sidebar, where a drop separates the pane into its own tab at the slot
+//   it lands on. Handled by `AppState.separatePane` (see `SidebarDropItem` /
+//   `TabSlotDropItem`), moving it between tabs — and projects — instead.
+//
+// Either way the `Pane` object, and with it the live surface and shell, is
+// reused; only the structure around it changes.
 
 extension UTType {
     /// In-app drag payload identifying the pane being moved: its UUID bytes.
