@@ -328,13 +328,47 @@ private enum SettingsWindowChrome {
 
 // MARK: - Shared styling
 
+/// Caption text is plain `Text`, which ignores the `isEnabled` environment
+/// that makes native controls draw themselves dimmed inside `.disabled(_:)`
+/// scopes — so a caption under a disabled control stayed full-strength while
+/// the control above it faded. Reading `\.isEnabled` here (the same value the
+/// built-in controls consult) lets every caption follow its group's state.
+private struct SettingsCaption: ViewModifier {
+    @Environment(\.isEnabled) private var isEnabled
+
+    func body(content: Content) -> some View {
+        content
+            .font(.system(size: 11))
+            .foregroundStyle(isEnabled ? AnyShapeStyle(.secondary) : AnyShapeStyle(.tertiary))
+    }
+}
+
+/// Primary text that should fade with its `.disabled(_:)` scope. Grouped-form
+/// rows draw a control's string-initializer label themselves, outside the
+/// control's own disabled rendering — the popup dims, its label doesn't — so
+/// controls pass an explicit label `Text` carrying this modifier instead. The
+/// label closure evaluates inside the control's scope, where `isEnabled` is
+/// already false.
+private struct DimsWhenDisabled: ViewModifier {
+    @Environment(\.isEnabled) private var isEnabled
+
+    func body(content: Content) -> some View {
+        content
+            .foregroundStyle(isEnabled ? AnyShapeStyle(.primary) : AnyShapeStyle(.tertiary))
+    }
+}
+
 extension View {
     /// The one style for a control's explanatory line. Every pane's
     /// descriptions went through this by hand before (one had drifted to
     /// `.footnote`), so it lives in a modifier now.
     func settingsCaption() -> some View {
-        font(.system(size: 11))
-            .foregroundStyle(.secondary)
+        modifier(SettingsCaption())
+    }
+
+    /// Fades primary text to match a disabled control — see `DimsWhenDisabled`.
+    func dimsWhenDisabled() -> some View {
+        modifier(DimsWhenDisabled())
     }
 
     @ViewBuilder
@@ -371,9 +405,12 @@ private struct SettingsSlider: View {
     let display: (Double) -> String
 
     var body: some View {
+        // The `Slider` dims itself inside a `.disabled(_:)` scope, but the
+        // flanking `Text`s are not controls and wouldn't follow on their own.
         HStack {
             Text(label)
                 .frame(width: Self.labelWidth, alignment: .leading)
+                .dimsWhenDisabled()
             if let step {
                 Slider(value: $value, in: range, step: step)
             } else {
@@ -382,6 +419,7 @@ private struct SettingsSlider: View {
             Text(display(value))
                 .monospacedDigit()
                 .frame(width: Self.valueWidth, alignment: .trailing)
+                .dimsWhenDisabled()
         }
     }
 }
@@ -624,11 +662,13 @@ private struct AppearanceSettings: View {
                 // inert rather than show a dead picker. "None" off / a style on
                 // are folded into one picker over the two underlying prefs.
                 if WindowAppearance.glassSupported {
-                    Picker("Liquid Glass", selection: glassSelection) {
+                    Picker(selection: glassSelection) {
                         Text("None").tag(WindowGlassStyle?.none)
                         ForEach(WindowGlassStyle.allCases) { style in
                             Text(style.displayName).tag(WindowGlassStyle?.some(style))
                         }
+                    } label: {
+                        Text("Liquid Glass").dimsWhenDisabled()
                     }
                     .disabled(backgroundOpacity >= 0.999)
                 }
@@ -723,10 +763,12 @@ private struct AppearanceSettings: View {
                     .settingsCaption()
 
                 Group {
-                    Picker("Tab switcher", selection: $tabSwitcherVisibility) {
+                    Picker(selection: $tabSwitcherVisibility) {
                         ForEach(TabSwitcherVisibility.allCases) { option in
                             Text(option.displayName).tag(option.rawValue)
                         }
+                    } label: {
+                        Text("Tab switcher").dimsWhenDisabled()
                     }
                     .onChange(of: tabSwitcherVisibility) { _, v in
                         Preferences.shared.tabSwitcherVisibility = TabSwitcherVisibility(rawValue: v) ?? .whenMultiple
@@ -734,10 +776,12 @@ private struct AppearanceSettings: View {
                     Text("Numbered control in the title bar for switching tabs by index.")
                         .settingsCaption()
 
-                    Picker("Tab switcher position", selection: $tabSwitcherPosition) {
+                    Picker(selection: $tabSwitcherPosition) {
                         ForEach(TabSwitcherPosition.allCases) { option in
                             Text(option.displayName).tag(option.rawValue)
                         }
+                    } label: {
+                        Text("Tab switcher position").dimsWhenDisabled()
                     }
                     .onChange(of: tabSwitcherPosition) { _, v in
                         Preferences.shared.tabSwitcherPosition = TabSwitcherPosition(rawValue: v) ?? .trailing
@@ -843,80 +887,91 @@ private struct QuickTerminalSettings: View {
                     .settingsCaption()
             }
 
+            // The shared `!enabled` gate sits on each section's Group so the
+            // captions dim with their controls (nested `.disabled` ANDs with
+            // it — an inner `false` never re-enables).
             Section("Position") {
-                Picker("Mode", selection: $positionMode) {
-                    ForEach(QuickTerminalAdjustMode.allCases) { mode in
-                        Text(mode.displayName).tag(mode)
+                Group {
+                    Picker(selection: $positionMode) {
+                        ForEach(QuickTerminalAdjustMode.allCases) { mode in
+                            Text(mode.displayName).tag(mode)
+                        }
+                    } label: {
+                        Text("Mode").dimsWhenDisabled()
                     }
-                }
-                .onChange(of: positionMode) { _, v in
-                    Preferences.shared.quickTerminalPositionMode = v
+                    .onChange(of: positionMode) { _, v in
+                        Preferences.shared.quickTerminalPositionMode = v
+                    }
+                    Text("Fixed anchors the panel with the sliders. Dynamic adds a grab handle and remembers where you drag it.")
+                        .settingsCaption()
+
+                    SettingsSlider(
+                        label: "X",
+                        value: $fixedX,
+                        range: 0 ... 1,
+                        step: 0.05,
+                        display: { anchorName($0, zero: "Left", one: "Right") }
+                    )
+                    .onChange(of: fixedX) { _, v in
+                        Preferences.shared.quickTerminalFixedX = v
+                    }
+                    .disabled(positionMode != .fixed)
+
+                    SettingsSlider(
+                        label: "Y",
+                        value: $fixedYTopDown,
+                        range: 0 ... 1,
+                        step: 0.05,
+                        display: { anchorName($0, zero: "Top", one: "Bottom") }
+                    )
+                    .onChange(of: fixedYTopDown) { _, v in
+                        Preferences.shared.quickTerminalFixedY = 1 - v
+                    }
+                    .disabled(positionMode != .fixed)
                 }
                 .disabled(!enabled)
-                Text("Fixed anchors the panel with the sliders. Dynamic adds a grab handle and remembers where you drag it.")
-                    .settingsCaption()
-
-                SettingsSlider(
-                    label: "X",
-                    value: $fixedX,
-                    range: 0 ... 1,
-                    step: 0.05,
-                    display: { anchorName($0, zero: "Left", one: "Right") }
-                )
-                .onChange(of: fixedX) { _, v in
-                    Preferences.shared.quickTerminalFixedX = v
-                }
-                .disabled(!enabled || positionMode != .fixed)
-
-                SettingsSlider(
-                    label: "Y",
-                    value: $fixedYTopDown,
-                    range: 0 ... 1,
-                    step: 0.05,
-                    display: { anchorName($0, zero: "Top", one: "Bottom") }
-                )
-                .onChange(of: fixedYTopDown) { _, v in
-                    Preferences.shared.quickTerminalFixedY = 1 - v
-                }
-                .disabled(!enabled || positionMode != .fixed)
             }
 
             Section("Size") {
-                Picker("Mode", selection: $sizeMode) {
-                    ForEach(QuickTerminalAdjustMode.allCases) { mode in
-                        Text(mode.displayName).tag(mode)
+                Group {
+                    Picker(selection: $sizeMode) {
+                        ForEach(QuickTerminalAdjustMode.allCases) { mode in
+                            Text(mode.displayName).tag(mode)
+                        }
+                    } label: {
+                        Text("Mode").dimsWhenDisabled()
                     }
-                }
-                .onChange(of: sizeMode) { _, v in
-                    Preferences.shared.quickTerminalSizeMode = v
+                    .onChange(of: sizeMode) { _, v in
+                        Preferences.shared.quickTerminalSizeMode = v
+                    }
+                    Text("Fixed sizes the panel with the sliders. Dynamic lets you resize it from its edges and reopens it at that size.")
+                        .settingsCaption()
+
+                    SettingsSlider(
+                        label: "Width",
+                        value: $qtWidth,
+                        range: 0.2 ... 1.0,
+                        step: 0.05,
+                        display: { "\(Int(($0 * 100).rounded()))%" }
+                    )
+                    .onChange(of: qtWidth) { _, v in
+                        Preferences.shared.quickTerminalWidthFraction = v
+                    }
+                    .disabled(sizeMode != .fixed)
+
+                    SettingsSlider(
+                        label: "Height",
+                        value: $qtHeight,
+                        range: 0.2 ... 1.0,
+                        step: 0.05,
+                        display: { "\(Int(($0 * 100).rounded()))%" }
+                    )
+                    .onChange(of: qtHeight) { _, v in
+                        Preferences.shared.quickTerminalHeightFraction = v
+                    }
+                    .disabled(sizeMode != .fixed)
                 }
                 .disabled(!enabled)
-                Text("Fixed sizes the panel with the sliders. Dynamic lets you resize it from its edges and reopens it at that size.")
-                    .settingsCaption()
-
-                SettingsSlider(
-                    label: "Width",
-                    value: $qtWidth,
-                    range: 0.2 ... 1.0,
-                    step: 0.05,
-                    display: { "\(Int(($0 * 100).rounded()))%" }
-                )
-                .onChange(of: qtWidth) { _, v in
-                    Preferences.shared.quickTerminalWidthFraction = v
-                }
-                .disabled(!enabled || sizeMode != .fixed)
-
-                SettingsSlider(
-                    label: "Height",
-                    value: $qtHeight,
-                    range: 0.2 ... 1.0,
-                    step: 0.05,
-                    display: { "\(Int(($0 * 100).rounded()))%" }
-                )
-                .onChange(of: qtHeight) { _, v in
-                    Preferences.shared.quickTerminalHeightFraction = v
-                }
-                .disabled(!enabled || sizeMode != .fixed)
             }
         }
         .formStyle(.grouped)
@@ -1225,11 +1280,13 @@ private struct UpdatesSettings: View {
                         updater.automaticallyChecksForUpdates = v
                     }
 
-                Toggle("Download updates in the background", isOn: $automaticallyDownloads)
-                    .disabled(!automaticallyChecks)
-                    .onChange(of: automaticallyDownloads) { _, v in
-                        updater.automaticallyDownloadsUpdates = v
-                    }
+                Toggle(isOn: $automaticallyDownloads) {
+                    Text("Download updates in the background").dimsWhenDisabled()
+                }
+                .disabled(!automaticallyChecks)
+                .onChange(of: automaticallyDownloads) { _, v in
+                    updater.automaticallyDownloadsUpdates = v
+                }
 
                 HStack {
                     Spacer()
