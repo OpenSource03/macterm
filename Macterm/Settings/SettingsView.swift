@@ -465,38 +465,10 @@ private struct GeneralSettings: View {
     @State
     private var hasFullDiskAccess: Bool? = FullDiskAccess.isGranted()
 
-    /// Whether the user's raw ghostty config opts into an ssh
-    /// shell-integration feature (`ssh-env` / `ssh-terminfo`, both default
-    /// OFF). Those wrappers are the only thing that execs the external ghostty
-    /// CLI in a way worth warning about — the `path` feature also needs the
-    /// binary, but it's vacuous without Ghostty.app installed (there'd be no
-    /// bin dir to add to PATH). Computed once per view creation: it reads the
-    /// user's config file, and disk has no place in `body`.
-    @State
-    private var wantsCLISSHFeatures: Bool = {
-        let text = MactermConfig.userGhosttyConfigText()
-        return ShellIntegrationFeatures.isEnabled("ssh-env", inConfigText: text)
-            || ShellIntegrationFeatures.isEnabled("ssh-terminfo", inConfigText: text)
-    }()
-
     var body: some View {
         Form {
             if hasFullDiskAccess == false {
                 FullDiskAccessBanner()
-            }
-
-            // Read the CLI probe from the process-lifetime cache — never spawn
-            // `ghostty +help` from inside `body` (it re-ran on every @State
-            // change, e.g. each scroll-speed slider tick, blocking the main
-            // thread on `waitUntilExit`; #3.1). Gated on the user actually
-            // opting into an ssh feature: before the gate this warned every
-            // Ghostty-less install about features nobody had turned on.
-            if wantsCLISSHFeatures {
-                if !GhosttyCLIProbe.isInstalled {
-                    GhosttyCLIBanner(reason: .notInstalled)
-                } else if GhosttyCLIProbe.sshWrapperBinDir == nil {
-                    GhosttyCLIBanner(reason: .tooOldForSSH)
-                }
             }
 
             Section("Ghostty Config") {
@@ -623,59 +595,6 @@ private struct FullDiskAccessBanner: View {
                         Button("Open System Settings…") {
                             NSWorkspace.shared.open(url)
                         }
-                    }
-                }
-            } icon: {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundStyle(MactermTheme.warning)
-            }
-            .padding(.vertical, 2)
-        }
-    }
-}
-
-// MARK: - Missing CLI banner
-
-/// Shown in General settings when the standalone ghostty CLI (shipped in
-/// Ghostty.app) is missing or too old to drive the shell-integration wrappers.
-/// A few wrappers exec that binary (the `ssh` wrapper calls `ghostty +ssh`), so
-/// without a compatible CLI those features are disabled and fall through to the
-/// plain command — the README link spells out which. Shown only to users whose
-/// own ghostty config enables an ssh feature (see `wantsCLISSHFeatures`).
-/// Embedded directly in a `Form`, so it renders as its own section.
-private struct GhosttyCLIBanner: View {
-    enum Reason {
-        case notInstalled
-        case tooOldForSSH
-
-        var message: String {
-            switch self {
-            case .notInstalled:
-                "Ghostty.app isn't installed, so a few shell-integration features can't run."
-            case .tooOldForSSH:
-                "Your installed Ghostty.app is too old for the ssh shell integration. "
-                    + "Update Ghostty.app to forward terminfo over ssh; until then, ssh runs normally."
-            }
-        }
-    }
-
-    let reason: Reason
-
-    private static let detailsURL = URL(
-        string: "https://github.com/thdxg/macterm#shell-integration"
-    )
-
-    var body: some View {
-        Section {
-            Label {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Some features are disabled")
-                        .font(.system(size: 13, weight: .semibold))
-                    Text(reason.message)
-                        .settingsCaption()
-                    if let url = Self.detailsURL {
-                        Link("Learn more", destination: url)
-                            .font(.system(size: 11))
                     }
                 }
             } icon: {

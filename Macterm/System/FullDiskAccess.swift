@@ -16,7 +16,7 @@ import Foundation
 enum FullDiskAccess {
     /// Deep link to System Settings → Privacy & Security → Full Disk Access.
     /// Optional only to satisfy `URL(string:)` — the literal always parses;
-    /// callers `if let` it, matching `GhosttyCLIBanner.detailsURL`.
+    /// callers `if let` it.
     static let settingsURL =
         URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
 
