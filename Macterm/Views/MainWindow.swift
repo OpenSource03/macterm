@@ -519,10 +519,12 @@ struct WorkspaceView: View {
                 },
                 // This closure is the PROCESS-EXIT path only (SplitTreeView
                 // wires it to the surface's onProcessExit; the user's Cmd+W
-                // goes through Responders → requestClosePane directly). For a
-                // pinned tab, the last pane's death unloads the tab instead
-                // of closing it.
-                onClosePane: { appState.paneProcessExited($0, projectID: project.id) },
+                // goes through Responders → requestClosePane directly).
+                // handleProcessExit classifies a remote pane's exit
+                // (drop → keep for the reconnect sweep, #281) and routes a
+                // real end through paneProcessExited, where a pinned tab's
+                // last pane unloads the tab instead of closing it (#285).
+                onClosePane: { appState.handleProcessExit($0, projectID: project.id) },
                 onCommandFinished: { paneID in
                     appState.acknowledgeFinishedCommandIfActive(paneID: paneID, projectID: project.id)
                 },

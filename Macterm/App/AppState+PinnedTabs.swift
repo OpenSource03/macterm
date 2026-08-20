@@ -472,7 +472,10 @@ extension AppState {
             guard let self else { return }
             pane.nsView?.onProcessExit = { [weak self, weak pane] in
                 guard let self, let pane else { return }
-                self.paneProcessExited(pane.id, projectID: PinnedTabs.projectID)
+                // Through the same classifier as rendered panes: a REMOTE
+                // pinned pane's dropped ssh must be kept for the reconnect
+                // sweep (#281), not read as its session ending.
+                self.handleProcessExit(pane.id, projectID: PinnedTabs.projectID)
             }
         }
     }

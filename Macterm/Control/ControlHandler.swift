@@ -267,17 +267,22 @@ final class ControlHandler {
         guard let parsed = ProjectPath.parse(rawPath) else {
             throw ControlError(code: .badRequest, message: "\"\(rawPath)\" is not an absolute or ~-prefixed path")
         }
-        guard case .local = parsed else {
-            throw ControlError(
-                code: .badRequest,
-                message: "remote projects aren't supported yet (#104)",
-                action: "pass a local directory path"
-            )
-        }
-        let canonical = ProjectPath.canonicalLocal(rawPath)
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: canonical, isDirectory: &isDirectory), isDirectory.boolValue else {
-            throw ControlError(code: .notFound, message: "no directory at \(canonical)")
+        // A remote spec ([user@]host:dir, #104) is stored verbatim — there is
+        // no local directory to canonicalize or existence-check; a wrong host
+        // or dir surfaces in the pane itself (ssh's error / the cd
+        // diagnostic), same as a sheet-created remote project.
+        let canonical: String
+        switch parsed {
+        case .local:
+            canonical = ProjectPath.canonicalLocal(rawPath)
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: canonical, isDirectory: &isDirectory),
+                  isDirectory.boolValue
+            else {
+                throw ControlError(code: .notFound, message: "no directory at \(canonical)")
+            }
+        case .remote:
+            canonical = rawPath
         }
 
         // Always create — `project create` is not idempotent: re-running adds a
