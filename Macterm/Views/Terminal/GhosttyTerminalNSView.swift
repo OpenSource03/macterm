@@ -1,4 +1,5 @@
 import AppKit
+import CoreText
 import GhosttyKit
 import QuartzCore
 
@@ -14,6 +15,80 @@ final class GhosttyTerminalNSView: NSView {
     /// idea as Ghostty's `NonDraggableHostingView`. Unconditional: a click on
     /// the terminal should always be terminal input, never a window drag.
     override var mouseDownCanMoveWindow: Bool { false }
+
+    // MARK: - Accessibility
+
+    /// Expose the focused terminal as an editable text target to accessibility
+    /// clients such as VoiceOver and dictation tools, matching Ghostty.app.
+    override func isAccessibilityElement() -> Bool {
+        true
+    }
+
+    override func accessibilityRole() -> NSAccessibility.Role? {
+        .textArea
+    }
+
+    override func accessibilityHelp() -> String? {
+        "Terminal content area"
+    }
+
+    override func accessibilityValue() -> Any? {
+        cachedAccessibilityScreenContents()
+    }
+
+    override func accessibilitySelectedTextRange() -> NSRange {
+        selectedRange()
+    }
+
+    override func accessibilitySelectedText() -> String? {
+        guard let surface else { return nil }
+        var text = ghostty_text_s()
+        guard ghostty_surface_read_selection(surface, &text) else { return nil }
+        defer { ghostty_surface_free_text(surface, &text) }
+        guard let pointer = text.text else { return nil }
+        let selectedText = String(cString: pointer)
+        return selectedText.isEmpty ? nil : selectedText
+    }
+
+    override func accessibilityNumberOfCharacters() -> Int {
+        cachedAccessibilityScreenContents().count
+    }
+
+    override func accessibilityVisibleCharacterRange() -> NSRange {
+        NSRange(location: 0, length: cachedAccessibilityScreenContents().count)
+    }
+
+    override func accessibilityLine(for index: Int) -> Int {
+        let content = cachedAccessibilityScreenContents()
+        return String(content.prefix(index)).components(separatedBy: .newlines).count - 1
+    }
+
+    override func accessibilityString(for range: NSRange) -> String? {
+        let content = cachedAccessibilityScreenContents()
+        guard let swiftRange = Range(range, in: content) else { return nil }
+        return String(content[swiftRange])
+    }
+
+    override func accessibilityAttributedString(for range: NSRange) -> NSAttributedString? {
+        guard let surface, let plainString = accessibilityString(for: range) else { return nil }
+        var attributes: [NSAttributedString.Key: Any] = [:]
+        if let fontRaw = ghostty_surface_quicklook_font(surface) {
+            let font = Unmanaged<CTFont>.fromOpaque(fontRaw)
+            attributes[.font] = font.takeUnretainedValue()
+            font.release()
+        }
+        return NSAttributedString(string: plainString, attributes: attributes)
+    }
+
+    private func cachedAccessibilityScreenContents() -> String {
+        let now = ContinuousClock.now
+        if let cache = accessibilityScreenContentsCache, now < cache.expiresAt {
+            return cache.contents
+        }
+        let contents = readText(scrollback: true) ?? ""
+        accessibilityScreenContentsCache = (contents, now + .milliseconds(500))
+        return contents
+    }
 
     /// Weak registry of every live instance so global operations (e.g. config
     /// reload) can iterate without a central cache.
@@ -351,7 +426,10 @@ final class GhosttyTerminalNSView: NSView {
     }
 
     private var _markedRange: NSRange = .init(location: NSNotFound, length: 0)
-    private var _selectedRange: NSRange = .init(location: NSNotFound, length: 0)
+    private var accessibilityScreenContentsCache: (
+        contents: String,
+        expiresAt: ContinuousClock.Instant
+    )?
     private var keyTextAccumulator: [String] = []
     private var currentKeyEvent: NSEvent?
 
@@ -587,8 +665,13 @@ final class GhosttyTerminalNSView: NSView {
     func destroySurface() {
         isDestroyed = true
         clearCommandSubmissionEvidence()
+        // A composition in flight has nowhere left to commit — drop it before
+        // the surface goes, so a reattached surface starts uncomposed rather
+        // than inheriting a preedit that can never be resolved.
+        discardMarkedText()
         if let surface { ghostty_surface_free(surface) }
         surface = nil
+        accessibilityScreenContentsCache = nil
         configCStrings.forEach { free($0) }
         configCStrings = []
     }
@@ -793,6 +876,11 @@ final class GhosttyTerminalNSView: NSView {
     }
 
     override func resignFirstResponder() -> Bool {
+        // Before super, while `inputContext` still resolves to ours. Focus
+        // moves off a pane constantly (tab switch, split focus, palette), and
+        // any of those landing mid-composition would otherwise strand
+        // `_markedRange` and kill plain-key input in this pane for good.
+        discardMarkedText()
         let result = super.resignFirstResponder()
         if result, let surface { ghostty_surface_set_focus(surface, false) }
         if result { syncSecureInputFocus(false) }
@@ -1592,9 +1680,12 @@ extension GhosttyTerminalNSView {
 extension GhosttyTerminalNSView: @preconcurrency NSTextInputClient {
     func insertText(_ string: Any, replacementRange: NSRange) {
         let text = (string as? String) ?? (string as? NSAttributedString)?.string ?? ""
-        guard !text.isEmpty else { return }
+        // A commit always ends the composition — including an empty one, which
+        // is how some input sources signal "abandon what you were composing".
+        // Clearing before the empty-text bail keeps `hasMarkedText` honest.
         _markedRange = NSRange(location: NSNotFound, length: 0)
         if let surface { ghostty_surface_preedit(surface, nil, 0) }
+        guard !text.isEmpty else { return }
         if currentKeyEvent != nil {
             keyTextAccumulator.append(text)
         } else if let surface {
@@ -1608,22 +1699,31 @@ extension GhosttyTerminalNSView: @preconcurrency NSTextInputClient {
         }
     }
 
+    /// `_markedRange` mirrors AppKit's composition state, so it is maintained on
+    /// EVERY call the input system makes — never gated on there being a surface.
+    /// A `guard let surface` here used to skip the bookkeeping, which desynced
+    /// the mirror from AppKit in both directions across a `destroySurface()`:
+    /// a composition begun without a surface read as not-composing, and one
+    /// ended without a surface stayed marked forever. The latter is the
+    /// damaging direction — see `discardMarkedText`.
     func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
-        guard let surface else { return }
         let text = (string as? String) ?? (string as? NSAttributedString)?.string ?? ""
         _markedRange = text.isEmpty ? NSRange(location: NSNotFound, length: 0) : NSRange(location: 0, length: text.utf16.count)
-        _selectedRange = selectedRange
+        guard let surface else { return }
         text.withCString { ghostty_surface_preedit(surface, $0, UInt(text.utf8.count)) }
     }
 
     func unmarkText() {
-        guard let surface else { return }
         _markedRange = NSRange(location: NSNotFound, length: 0)
-        ghostty_surface_preedit(surface, nil, 0)
+        if let surface { ghostty_surface_preedit(surface, nil, 0) }
     }
 
     func selectedRange() -> NSRange {
-        _selectedRange
+        guard let surface else { return NSRange() }
+        var text = ghostty_text_s()
+        guard ghostty_surface_read_selection(surface, &text) else { return NSRange() }
+        defer { ghostty_surface_free_text(surface, &text) }
+        return NSRange(location: Int(text.offset_start), length: Int(text.offset_len))
     }
 
     func markedRange() -> NSRange {
@@ -1632,6 +1732,28 @@ extension GhosttyTerminalNSView: @preconcurrency NSTextInputClient {
 
     func hasMarkedText() -> Bool {
         _markedRange.location != NSNotFound
+    }
+
+    /// Abandons an in-flight IME composition, clearing both our mirror of it
+    /// and the input source's own state.
+    ///
+    /// AppKit does not promise an `unmarkText` (or a commit) when focus leaves
+    /// a view mid-composition, and a stranded `_markedRange` is not a cosmetic
+    /// leak: `keyDown`'s composing branch forwards NOTHING for an unmodified
+    /// key — not the translated text, not even an encoded keypress — so the
+    /// pane's keyboard goes dead for ordinary typing while modifier chords keep
+    /// working. Nothing in the view could recover from that state on its own,
+    /// because the only two exits (`insertText`/`unmarkText`) are calls the
+    /// input system makes and it believes the composition is already over.
+    ///
+    /// `discardMarkedText()` is what tells the input source to drop its half;
+    /// our own state is cleared first so a re-entrant callback can't revive it.
+    /// `inputContext` is read before `super.resignFirstResponder()` runs, since
+    /// AppKit returns nil for a view that is no longer the first responder.
+    func discardMarkedText() {
+        guard hasMarkedText() else { return }
+        unmarkText()
+        inputContext?.discardMarkedText()
     }
 
     func attributedSubstring(forProposedRange range: NSRange, actualRange: NSRangePointer?) -> NSAttributedString? {

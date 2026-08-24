@@ -187,6 +187,16 @@ final class Preferences {
         didSet { defaults.set(showTabStatusIndicator, forKey: Keys.showTabStatusIndicator) }
     }
 
+    /// Whether the running spinner also replaces an AI agent's logo (#225).
+    /// Off keeps the agent logo while the agent works — agent CLIs draw their
+    /// own busy indicator in the tab title, so the spinner is redundant there —
+    /// while the done dot still appears (it overlays the logo rather than
+    /// replacing it). Meaningful only while `showTabStatusIndicator` and
+    /// `showAgentIcons` are both on.
+    var showSpinnerOverAgentIcons: Bool {
+        didSet { defaults.set(showSpinnerOverAgentIcons, forKey: Keys.showSpinnerOverAgentIcons) }
+    }
+
     /// Auto-name tabs after the live foreground process / OSC title (on by
     /// default). Off = tabs hold their static fallback (login shell name, or
     /// the host name for remote panes); a user-set custom title always wins
@@ -215,6 +225,35 @@ final class Preferences {
         didSet { defaults.set(backgroundSSHConnections, forKey: Keys.backgroundSSHConnections) }
     }
 
+    /// Reconnect a remote pane whose ssh connection died (#281): respawn the
+    /// surface so it redials and reattaches the SAME zmx session (which
+    /// replays scrollback), instead of leaving the pane on ghostty's
+    /// abnormal-exit overlay until the app is relaunched. Trigger-driven —
+    /// system wake, app activation, project selection — never a timer, so an
+    /// unreachable host is retried a bounded number of times per return, not
+    /// polled. Off exists for the same reason as `backgroundSSHConnections`:
+    /// a Touch ID-gated key (#272) would raise one prompt per dead pane on
+    /// every wake.
+    var reconnectRemotePanes: Bool {
+        didSet { defaults.set(reconnectRemotePanes, forKey: Keys.reconnectRemotePanes) }
+    }
+
+    /// Stable per-installation identity, lazily created on first use. Stamped
+    /// onto remote zmx sessions as a `macterm.owner` label so the orphan sweep
+    /// can tell OUR sessions apart from another machine's on a shared host
+    /// (#281) — never the hostname, which two Macs can share and the user can
+    /// rename. UUID hex without dashes, because zmx label values allow only
+    /// `[A-Za-z0-9._-]`. Not `@Observable` state (no UI reads it), so it's a
+    /// computed lazy read-through rather than a stored property.
+    var installationID: String {
+        if let existing = defaults.string(forKey: Keys.installationID), !existing.isEmpty {
+            return existing
+        }
+        let fresh = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+        defaults.set(fresh, forKey: Keys.installationID)
+        return fresh
+    }
+
     /// Slide the hidden sidebar out while the pointer sits at the window's
     /// leading edge, and back in when it leaves (`MainWindow`'s hover peek).
     var peekSidebarWhenHidden: Bool {
@@ -237,7 +276,7 @@ final class Preferences {
     /// Bounds of the sidebar column, shared by the persisted width's clamp and
     /// `MainWindow`'s `navigationSplitViewColumnWidth` so a stored value can
     /// never fall outside what the column accepts.
-    static let sidebarWidthRange: ClosedRange<Double> = 140 ... 280
+    static let sidebarWidthRange: ClosedRange<Double> = 140 ... 400
     static let defaultSidebarWidth: Double = 180
 
     /// Which appcast channel auto-updates come from. Read by `Updater`'s
@@ -408,25 +447,17 @@ final class Preferences {
 
     // MARK: - Ghostty config
 
-    /// Path to the user's Ghostty config. Empty string = don't load any user
-    /// config (Macterm-defaults only). Tilde-expand via
-    /// `expandedUserGhosttyConfigPath` at use sites.
-    ///
-    /// Note: this setter does NOT auto-reload, intentionally. Settings UI is
-    /// the only writer and it calls `GhosttyApp.shared.reloadConfig()`
-    /// directly so it can surface any errors (missing file, parse errors)
-    /// in an alert. Other reloads happen silently.
-    var userGhosttyConfigPath: String {
-        didSet {
-            defaults.set(userGhosttyConfigPath, forKey: Keys.userGhosttyConfigPath)
-        }
-    }
+    /// The selected source for the user's Ghostty config.
+    private(set) var ghosttyConfigSelection: GhosttyConfigSelection
 
-    /// `userGhosttyConfigPath` with leading `~` expanded to the home dir.
-    /// Empty when the user has disabled loading by clearing the field.
-    var expandedUserGhosttyConfigPath: String {
-        guard !userGhosttyConfigPath.isEmpty else { return "" }
-        return (userGhosttyConfigPath as NSString).expandingTildeInPath
+    func setGhosttyConfig(loadsDefaultFiles: Bool, customPaths: [String]) {
+        ghosttyConfigSelection = GhosttyConfigSelection(
+            loadsDefaultFiles: loadsDefaultFiles,
+            customPaths: customPaths
+        )
+        defaults.set(loadsDefaultFiles, forKey: Keys.loadsDefaultGhosttyConfigFiles)
+        defaults.set(customPaths, forKey: Keys.customGhosttyConfigPaths)
+        defaults.removeObject(forKey: Keys.userGhosttyConfigPath)
     }
 
     /// Programs a passthrough-flagged keybind yields to, as the user typed them
@@ -584,7 +615,7 @@ final class Preferences {
             .flatMap(WindowGlassStyle.init(rawValue:)) ?? .regular
         adaptiveTerminalChromeEnabled = defaults.object(forKey: Keys.adaptiveTerminalChromeEnabled) as? Bool ?? false
         hideTitleBar = defaults.object(forKey: Keys.hideTitleBar) as? Bool ?? false
-        userGhosttyConfigPath = defaults.string(forKey: Keys.userGhosttyConfigPath) ?? "~/.config/ghostty/config"
+        ghosttyConfigSelection = Self.readGhosttyConfigSelection(from: defaults)
         passthroughPrograms = defaults.string(forKey: Keys.passthroughPrograms) ?? ""
         quickTerminalWidthFraction = Self.clampFraction(defaults.double(forKey: Keys.quickTerminalWidth), fallback: 0.6)
         quickTerminalHeightFraction = Self.clampFraction(defaults.double(forKey: Keys.quickTerminalHeight), fallback: 0.5)
@@ -619,9 +650,11 @@ final class Preferences {
         tabIconSymbol = defaults.string(forKey: Keys.tabIconSymbol) ?? "terminal"
         showAgentIcons = defaults.object(forKey: Keys.showAgentIcons) as? Bool ?? true
         showTabStatusIndicator = defaults.object(forKey: Keys.showTabStatusIndicator) as? Bool ?? false
+        showSpinnerOverAgentIcons = defaults.object(forKey: Keys.showSpinnerOverAgentIcons) as? Bool ?? true
         autoNameTabs = defaults.object(forKey: Keys.autoNameTabs) as? Bool ?? true
         showNewProjectButton = defaults.object(forKey: Keys.showNewProjectButton) as? Bool ?? true
         backgroundSSHConnections = defaults.object(forKey: Keys.backgroundSSHConnections) as? Bool ?? true
+        reconnectRemotePanes = defaults.object(forKey: Keys.reconnectRemotePanes) as? Bool ?? true
         peekSidebarWhenHidden = defaults.object(forKey: Keys.peekSidebarWhenHidden) as? Bool ?? true
         let storedSidebarWidth = Self.clampSidebarWidth(defaults.object(forKey: Keys.sidebarWidth) as? Double)
         sidebarWidth = storedSidebarWidth
@@ -687,6 +720,27 @@ final class Preferences {
         }
     }
 
+    /// Reads the two-layer config preference. The single-path key came from the
+    /// previous UI, where choosing a custom path replaced Ghostty's defaults.
+    /// Keep that exact behavior when migrating it.
+    static func readGhosttyConfigSelection(from defaults: UserDefaults) -> GhosttyConfigSelection {
+        let hasCurrentValue = defaults.object(forKey: Keys.loadsDefaultGhosttyConfigFiles) != nil
+            || defaults.object(forKey: Keys.customGhosttyConfigPaths) != nil
+        if hasCurrentValue {
+            return GhosttyConfigSelection(
+                loadsDefaultFiles: defaults.object(forKey: Keys.loadsDefaultGhosttyConfigFiles) as? Bool ?? true,
+                customPaths: defaults.stringArray(forKey: Keys.customGhosttyConfigPaths) ?? []
+            )
+        }
+        guard let legacyPath = defaults.string(forKey: Keys.userGhosttyConfigPath) else {
+            return .automatic
+        }
+        return GhosttyConfigSelection(
+            loadsDefaultFiles: false,
+            customPaths: legacyPath.isEmpty ? [] : [legacyPath]
+        )
+    }
+
     // MARK: - UserDefaults keys
 
     enum Keys {
@@ -700,6 +754,9 @@ final class Preferences {
         static let windowGlassStyle = "macterm.window.glassStyle"
         static let adaptiveTerminalChromeEnabled = "macterm.window.adaptiveTerminalChromeEnabled"
         static let hideTitleBar = "macterm.window.hideTitleBar"
+        static let loadsDefaultGhosttyConfigFiles = "macterm.ghostty.loadsDefaultConfigFiles"
+        static let customGhosttyConfigPaths = "macterm.ghostty.customConfigPaths"
+        /// Legacy single-path key. Read only for migration.
         static let userGhosttyConfigPath = "macterm.ghostty.userConfigPath"
         static let passthroughPrograms = "macterm.hotkey.passthroughPrograms"
         static let quickTerminalWidth = "macterm.quickTerminal.width"
@@ -717,9 +774,12 @@ final class Preferences {
         static let tabIconSymbol = "macterm.sidebar.tabIcon"
         static let showAgentIcons = "macterm.sidebar.showAgentIcons"
         static let showTabStatusIndicator = "macterm.sidebar.showTabStatusIndicator"
+        static let showSpinnerOverAgentIcons = "macterm.sidebar.showSpinnerOverAgentIcons"
         static let autoNameTabs = "macterm.tabs.autoName"
         static let showNewProjectButton = "macterm.sidebar.showNewProjectButton"
         static let backgroundSSHConnections = "macterm.remote.backgroundSSHConnections"
+        static let reconnectRemotePanes = "macterm.remote.reconnectDroppedPanes"
+        static let installationID = "macterm.installationID"
         static let peekSidebarWhenHidden = "macterm.sidebar.peekWhenHidden"
         static let sidebarWidth = "macterm.sidebar.width"
         static let updateChannel = "macterm.updates.channel"

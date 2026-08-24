@@ -11,6 +11,29 @@ import Testing
 @MainActor
 struct PreferencesTests {
     @Test
+    func reconnect_remote_panes_defaults_on_and_round_trips() {
+        let prior = Preferences.shared.reconnectRemotePanes
+        defer { Preferences.shared.reconnectRemotePanes = prior }
+
+        // Fresh (wiped) test suite → the default is on.
+        #expect(Preferences.shared.reconnectRemotePanes)
+
+        Preferences.shared.reconnectRemotePanes = false
+        #expect(Preferences.defaults.object(forKey: Preferences.Keys.reconnectRemotePanes) as? Bool == false)
+    }
+
+    @Test
+    func installation_id_is_lazily_created_stable_and_label_safe() {
+        let first = Preferences.shared.installationID
+        // Stable across reads (it's the persistent ownership identity zmx
+        // sessions get stamped with, #281).
+        #expect(Preferences.shared.installationID == first)
+        // zmx label values allow only [A-Za-z0-9._-]; ours is bare hex.
+        #expect(!first.isEmpty)
+        #expect(first.allSatisfy { $0.isHexDigit && ($0.isNumber || $0.isLowercase) })
+    }
+
+    @Test
     func shared_writes_do_not_reach_the_standard_defaults_domain() {
         let sentinel = UUID()
         let prior = Preferences.shared.activeProjectID
@@ -64,5 +87,40 @@ struct PreferencesTests {
         #expect(Preferences.clampSidebarWidth(range.lowerBound - 40) == range.lowerBound)
         #expect(Preferences.clampSidebarWidth(range.upperBound + 40) == range.upperBound)
         #expect(Preferences.clampSidebarWidth(213.5) == 213.5)
+    }
+
+    @Test
+    func ghostty_config_defaults_to_automatic_loading() throws {
+        let defaults = try isolatedDefaults()
+
+        #expect(Preferences.readGhosttyConfigSelection(from: defaults) == .automatic)
+    }
+
+    @Test
+    func ghostty_config_reads_current_layered_preferences() throws {
+        let defaults = try isolatedDefaults()
+        defaults.set(false, forKey: Preferences.Keys.loadsDefaultGhosttyConfigFiles)
+        defaults.set(["/one", "/two"], forKey: Preferences.Keys.customGhosttyConfigPaths)
+
+        #expect(Preferences.readGhosttyConfigSelection(from: defaults) == GhosttyConfigSelection(
+            loadsDefaultFiles: false,
+            customPaths: ["/one", "/two"]
+        ))
+    }
+
+    @Test(arguments: ["", "/legacy/config.ghostty"])
+    func ghostty_config_migrates_legacy_custom_only_mode(path: String) throws {
+        let defaults = try isolatedDefaults()
+        defaults.set(path, forKey: Preferences.Keys.userGhosttyConfigPath)
+
+        #expect(Preferences.readGhosttyConfigSelection(from: defaults) == GhosttyConfigSelection(
+            loadsDefaultFiles: false,
+            customPaths: path.isEmpty ? [] : [path]
+        ))
+    }
+
+    private func isolatedDefaults() throws -> UserDefaults {
+        let suiteName = "com.thdxg.macterm.preferences-tests.\(UUID().uuidString)"
+        return try #require(UserDefaults(suiteName: suiteName))
     }
 }

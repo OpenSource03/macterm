@@ -106,6 +106,9 @@ struct MainWindow: View {
                     // content width regardless) — kept as the honest request
                     // for the launch width AppKit actually installs.
                     ideal: CGFloat(Preferences.shared.launchSidebarWidth),
+                    // Also ignored — a drag sails straight past it. The cap
+                    // that holds is `WindowAppearance.enforceSidebarWidthLimit`
+                    // (NSSplitViewItem.maximumThickness, re-asserted per drag).
                     max: CGFloat(Preferences.sidebarWidthRange.upperBound)
                 )
                 .onGeometryChange(for: CGFloat.self) { proxy in
@@ -456,6 +459,9 @@ struct MainWindow: View {
 
     private var activeProject: Project? {
         guard let pid = appState.activeProjectID else { return nil }
+        // The pinned workspace has no ProjectStore row; render it through the
+        // synthetic project.
+        if pid == PinnedTabs.projectID { return PinnedTabs.project }
         return projectStore.projects.first { $0.id == pid }
     }
 
@@ -470,6 +476,8 @@ struct MainWindow: View {
 
     private var activeTabTitle: String {
         guard let project = activeProject else { return "" }
+        // The pinned workspace has no project directory worth advertising.
+        if project.id == PinnedTabs.projectID { return "" }
         return project.path
     }
 }
@@ -618,7 +626,14 @@ struct WorkspaceView: View {
                     tab.split(paneID: paneID, direction: dir)
                     appState.saveWorkspaces()
                 },
-                onClosePane: { appState.requestClosePane($0, projectID: project.id) },
+                // This closure is the PROCESS-EXIT path only (SplitTreeView
+                // wires it to the surface's onProcessExit; the user's Cmd+W
+                // goes through Responders → requestClosePane directly).
+                // handleProcessExit classifies a remote pane's exit
+                // (drop → keep for the reconnect sweep, #281) and routes a
+                // real end through paneProcessExited, where a pinned tab's
+                // last pane unloads the tab instead of closing it (#285).
+                onClosePane: { appState.handleProcessExit($0, projectID: project.id) },
                 onCommandFinished: { paneID in
                     appState.acknowledgeFinishedCommandIfActive(paneID: paneID, projectID: project.id)
                 },
