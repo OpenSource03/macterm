@@ -113,7 +113,7 @@ enum SidebarPeekStyle: String, CaseIterable, Identifiable {
         case .resizeTerminal:
             "Slides the native sidebar column out and temporarily resizes the terminal."
         case .overlayTerminal:
-            "Shows a floating Liquid Glass sidebar over the terminal without changing its size."
+            "Shows a floating sidebar over the terminal without changing its size."
         }
     }
 }

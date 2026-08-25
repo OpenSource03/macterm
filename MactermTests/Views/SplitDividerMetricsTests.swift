@@ -80,4 +80,11 @@ struct SplitDividerMetricsTests {
         // No axis to measure against: hold still instead of dividing by zero.
         #expect(SplitDividerMetrics.draggedRatio(start: 0.4, delta: 250, total: 0) == 0.4)
     }
+
+    @Test
+    func drag_axes_follow_layout_coordinates() {
+        let origin = CGPoint(x: 100, y: 100)
+        #expect(ResizeDragAxis.horizontal.delta(from: origin, to: CGPoint(x: 125, y: 75)) == 25)
+        #expect(ResizeDragAxis.vertical.delta(from: origin, to: CGPoint(x: 125, y: 75)) == 25)
+    }
 }

@@ -1,4 +1,3 @@
-import AppKit
 import SwiftUI
 
 /// The overlay peek is a separate visual surface, never a second split-view
@@ -8,6 +7,8 @@ struct SidebarOverlayPanel: View {
     let width: CGFloat
     let chromeHidden: Bool
     let windowCornerRadius: CGFloat?
+    let presentation: SidebarPresentationState
+    let isInteractive: Bool
     let onResize: (CGFloat) -> Void
     let onResizeStateChanged: (Bool) -> Void
 
@@ -19,25 +20,33 @@ struct SidebarOverlayPanel: View {
     }
 
     var body: some View {
-        SidebarContent()
-            .safeAreaPadding(.top, chromeHidden ? SidebarOverlayMetrics.panelInset : 0)
-            .safeAreaPadding(.bottom, SidebarOverlayMetrics.panelInset)
-            .frame(width: width)
-            .frame(maxHeight: .infinity)
-            .background {
-                SidebarOverlayBackground(cornerRadius: cornerRadius)
-                    .padding(.vertical, SidebarOverlayMetrics.panelInset)
-                    .ignoresSafeArea(.container, edges: .vertical)
-            }
-            .overlay(alignment: .trailing) {
-                SidebarResizeBand(
-                    widthAtDragStart: { width },
-                    onResize: onResize,
-                    onResizeStateChanged: onResizeStateChanged
-                )
-                .frame(width: SplitDividerMetrics.bandThickness)
-            }
-            .padding(.leading, SidebarOverlayMetrics.panelInset)
+        SidebarContent(
+            presentation: presentation,
+            isInteractive: isInteractive,
+            paintsFallbackFooterBackground: false
+        )
+        .safeAreaPadding(.top, chromeHidden ? SidebarOverlayMetrics.panelInset : 0)
+        .safeAreaPadding(.bottom, SidebarOverlayMetrics.panelInset)
+        .frame(width: width)
+        .frame(maxHeight: .infinity)
+        .background {
+            SidebarOverlayBackground(cornerRadius: cornerRadius)
+                .padding(.vertical, SidebarOverlayMetrics.panelInset)
+                .ignoresSafeArea(.container, edges: .vertical)
+        }
+        .overlay(alignment: .trailing) {
+            ResizeDragBand(
+                axis: .horizontal,
+                valueAtDragStart: { width },
+                resizedValue: { start, delta in
+                    SidebarOverlayMetrics.resizedWidth(start: start, delta: delta)
+                },
+                onResize: onResize,
+                onResizeStateChanged: onResizeStateChanged
+            )
+            .frame(width: SplitDividerMetrics.bandThickness)
+        }
+        .padding(.leading, SidebarOverlayMetrics.panelInset)
     }
 }
 
@@ -48,6 +57,47 @@ struct SidebarOverlayPanel: View {
 @MainActor
 enum SidebarOverlayMetrics {
     static let panelInset: CGFloat = 4
+    static let hoverActivationWidth: CGFloat = 12
+    static let hoverApproachWidth: CGFloat = 64
+    static let fastExitRecoveryWidth: CGFloat = 128
+    static let hoverExitPadding: CGFloat = 8
+    static let outsideAcquisitionDepth: CGFloat = 128
+    static let outsideVerticalTolerance: CGFloat = 16
+
+    /// A stationary pointer still has to reach the exact edge zone. A pointer
+    /// moving toward the edge gets a wider capture corridor so event sampling
+    /// cannot skip the 12-point trigger at ordinary fast mouse speeds.
+    static func shouldBeginHover(pointX: CGFloat, previousX: CGFloat?) -> Bool {
+        if pointX <= hoverActivationWidth { return true }
+        guard let previousX else { return false }
+        guard pointX <= hoverApproachWidth else { return false }
+        return pointX < previousX
+    }
+
+    /// Last-resort recovery when the pointer crosses the left edge between two
+    /// hover samples. This is used only for overlay mode and only when movement
+    /// was toward the sidebar; spatial outside-window tracking retracts it if
+    /// the user did not intend to come back onto the panel.
+    static func shouldRecoverFastExit(lastX: CGFloat?, wasApproaching: Bool) -> Bool {
+        guard wasApproaching, let lastX else { return false }
+        return lastX <= fastExitRecoveryWidth
+    }
+
+    /// Global retention region used after SwiftUI hover delivery ends at the
+    /// window boundary. The overlay remains open while the pointer is still
+    /// beside or over the sidebar, including a forgiving gutter outside the
+    /// leading window edge. There is no time-based dismissal inside this area.
+    static func retainsOutsidePointer(
+        _ pointer: CGPoint,
+        windowFrame: CGRect,
+        sidebarWidth: CGFloat
+    ) -> Bool {
+        let minX = windowFrame.minX - outsideAcquisitionDepth
+        let maxX = min(windowFrame.minX + sidebarWidth + hoverExitPadding, windowFrame.maxX)
+        let minY = windowFrame.minY - outsideVerticalTolerance
+        let maxY = windowFrame.maxY + outsideVerticalTolerance
+        return (minX ... maxX).contains(pointer.x) && (minY ... maxY).contains(pointer.y)
+    }
 
     static func cornerRadius(windowCornerRadius: CGFloat?, inset: CGFloat) -> CGFloat {
         guard let windowCornerRadius, windowCornerRadius > 0 else { return 0 }
@@ -60,6 +110,35 @@ enum SidebarOverlayMetrics {
     }
 }
 
+/// Keeps the user's last width authoritative while a native split-view column
+/// animates open. SwiftUI reports intermediate/stale native widths during that
+/// animation; those must not overwrite a width just dragged on the overlay.
+struct SidebarWidthHandoff {
+    private(set) var width: CGFloat
+    private(set) var pendingNativeWidth: CGFloat?
+
+    mutating func overlayResized(to width: CGFloat) -> CGFloat {
+        pendingNativeWidth = nil
+        self.width = width
+        return width
+    }
+
+    mutating func nativeMeasured(_ width: CGFloat) -> CGFloat? {
+        if let pendingNativeWidth {
+            guard abs(width - pendingNativeWidth) < 0.5 else { return nil }
+            self.pendingNativeWidth = nil
+        }
+        self.width = width
+        return width
+    }
+
+    mutating func beginNativeHandoff() -> CGFloat {
+        let target = pendingNativeWidth ?? width
+        pendingNativeWidth = target
+        return target
+    }
+}
+
 private struct SidebarOverlayBackground: View {
     let cornerRadius: CGFloat
 
@@ -67,7 +146,11 @@ private struct SidebarOverlayBackground: View {
         if #available(macOS 26.0, *) {
             Color.clear
                 .glassEffect(in: .rect(cornerRadius: cornerRadius))
-                .shadow(color: MactermTheme.border, radius: max(cornerRadius, 1), x: SidebarOverlayMetrics.panelInset)
+                .shadow(
+                    color: MactermTheme.border,
+                    radius: max(cornerRadius, 1),
+                    x: SidebarOverlayMetrics.panelInset
+                )
         } else {
             RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                 .fill(.regularMaterial)
@@ -75,104 +158,11 @@ private struct SidebarOverlayBackground: View {
                     RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                         .strokeBorder(MactermTheme.border, lineWidth: 1)
                 }
-                .shadow(color: MactermTheme.border, radius: max(cornerRadius, 1), x: SidebarOverlayMetrics.panelInset)
-        }
-    }
-}
-
-/// AppKit drag band on the panel's trailing edge. It owns the resize cursor and
-/// keeps receiving drag events after the pointer leaves the narrow hit area,
-/// which a SwiftUI gesture layered over a terminal NSView cannot guarantee.
-private struct SidebarResizeBand: NSViewRepresentable {
-    let widthAtDragStart: () -> CGFloat
-    let onResize: (CGFloat) -> Void
-    let onResizeStateChanged: (Bool) -> Void
-
-    func makeNSView(context _: Context) -> BandView {
-        let view = BandView()
-        configure(view)
-        return view
-    }
-
-    func updateNSView(_ view: BandView, context _: Context) {
-        configure(view)
-    }
-
-    private func configure(_ view: BandView) {
-        view.widthAtDragStart = widthAtDragStart
-        view.onResize = onResize
-        view.onResizeStateChanged = onResizeStateChanged
-    }
-
-    final class BandView: NSView {
-        var widthAtDragStart: () -> CGFloat = { CGFloat(Preferences.defaultSidebarWidth) }
-        var onResize: (CGFloat) -> Void = { _ in }
-        var onResizeStateChanged: (Bool) -> Void = { _ in }
-
-        private var dragOriginX: CGFloat?
-        private var startWidth: CGFloat = .init(Preferences.defaultSidebarWidth)
-        private var isTransparentToHitTest = false
-
-        override var mouseDownCanMoveWindow: Bool { false }
-
-        override func acceptsFirstMouse(for _: NSEvent?) -> Bool {
-            true
-        }
-
-        override func updateTrackingAreas() {
-            super.updateTrackingAreas()
-            trackingAreas.forEach { removeTrackingArea($0) }
-            addTrackingArea(NSTrackingArea(
-                rect: .zero,
-                options: [.cursorUpdate, .activeInActiveApp, .inVisibleRect],
-                owner: self,
-                userInfo: nil
-            ))
-        }
-
-        override func cursorUpdate(with _: NSEvent) {
-            NSCursor.resizeLeftRight.set()
-        }
-
-        override func mouseDown(with event: NSEvent) {
-            dragOriginX = event.locationInWindow.x
-            startWidth = widthAtDragStart()
-            onResizeStateChanged(true)
-        }
-
-        override func mouseDragged(with event: NSEvent) {
-            guard let dragOriginX else { return }
-            NSCursor.resizeLeftRight.set()
-            onResize(SidebarOverlayMetrics.resizedWidth(
-                start: startWidth,
-                delta: event.locationInWindow.x - dragOriginX
-            ))
-        }
-
-        override func mouseUp(with _: NSEvent) {
-            dragOriginX = nil
-            onResizeStateChanged(false)
-        }
-
-        override func hitTest(_ point: NSPoint) -> NSView? {
-            isTransparentToHitTest ? nil : super.hitTest(point)
-        }
-
-        private func viewBeneath(_ event: NSEvent) -> NSView? {
-            isTransparentToHitTest = true
-            defer { isTransparentToHitTest = false }
-            let target = window?.contentView?.hitTest(event.locationInWindow)
-            return target === self ? nil : target
-        }
-
-        override func scrollWheel(with event: NSEvent) {
-            guard let target = viewBeneath(event) else { return super.scrollWheel(with: event) }
-            target.scrollWheel(with: event)
-        }
-
-        override func rightMouseDown(with event: NSEvent) {
-            guard let target = viewBeneath(event) else { return super.rightMouseDown(with: event) }
-            target.rightMouseDown(with: event)
+                .shadow(
+                    color: MactermTheme.border,
+                    radius: max(cornerRadius, 1),
+                    x: SidebarOverlayMetrics.panelInset
+                )
         }
     }
 }

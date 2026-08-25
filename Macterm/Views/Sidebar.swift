@@ -1,11 +1,6 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
-private enum SidebarItem: Hashable {
-    case project(UUID)
-    case tab(projectID: UUID, tabID: UUID)
-}
-
 /// A sidebar row's content region extends past the selection highlight's
 /// trailing edge. A short label never reaches out there, but content that
 /// fills the row — split segments, the merge drop slot, a fading title —
@@ -19,6 +14,7 @@ private extension View {
     @ViewBuilder
     func sidebarSafeAreaBar(
         isPresented: Bool,
+        paintsFallbackBackground: Bool,
         @ViewBuilder content: () -> some View
     ) -> some View {
         if isPresented {
@@ -29,7 +25,9 @@ private extension View {
             } else {
                 safeAreaInset(edge: .bottom, spacing: 0) {
                     content()
-                        .background(MactermTheme.bg)
+                        .background {
+                            if paintsFallbackBackground { MactermTheme.bg }
+                        }
                 }
             }
         } else {
@@ -132,16 +130,23 @@ struct SidebarContent: View {
     private var projectStore
     @AppStorage(Preferences.Keys.showNewProjectButton)
     private var showNewProjectButton = true
-    @State
-    private var expandedProjects: Set<UUID> = []
-    /// A Set (not a lone optional) so the sidebar supports native multi-select:
-    /// Cmd/Shift-click extends the selection, and a right-click acts on every
-    /// selected row at once (see `.contextMenu(forSelectionType:)` below).
-    @State
-    private var selection: Set<SidebarItem> = []
+    @Bindable
+    private var presentation: SidebarPresentationState
+    private let isInteractive: Bool
+    private let paintsFallbackFooterBackground: Bool
+
+    init(
+        presentation: SidebarPresentationState,
+        isInteractive: Bool,
+        paintsFallbackFooterBackground: Bool = true
+    ) {
+        self.presentation = presentation
+        self.isInteractive = isInteractive
+        self.paintsFallbackFooterBackground = paintsFallbackFooterBackground
+    }
 
     var body: some View {
-        List(selection: $selection) {
+        List(selection: $presentation.selection) {
             // Pinned tabs live above every project as flat rows (no header,
             // no disclosure), wrapped in a headerless Section so their ForEach
             // sits inside a container — mirroring the tab ForEach below, whose
@@ -207,6 +212,13 @@ struct SidebarContent: View {
         }
         .listStyle(.sidebar)
         .scrollContentBackground(.hidden)
+        .scrollPosition(id: Binding(
+            get: { presentation.scrollPosition },
+            set: { position in
+                guard isInteractive else { return }
+                presentation.scrollPosition = position
+            }
+        ))
         // The pin drop zone: a thin strip above the list that expands into a
         // visible "Pin Tab" band while a tab/pane drag hovers it. It lives
         // OUTSIDE the List on purpose — a plain view's `.dropDestination` has
@@ -222,7 +234,10 @@ struct SidebarContent: View {
                 onPinPane: { appState.separatePaneIntoPinned($0.paneID, atRecordIndex: 0) }
             )
         }
-        .sidebarSafeAreaBar(isPresented: showNewProjectButton) {
+        .sidebarSafeAreaBar(
+            isPresented: showNewProjectButton,
+            paintsFallbackBackground: paintsFallbackFooterBackground
+        ) {
             HStack(spacing: 0) {
                 Menu {
                     Button("Local Folder…") { openProject() }
@@ -247,11 +262,11 @@ struct SidebarContent: View {
             // puts the ink an equal ~20.5pt off both the left and bottom edges.
             .padding(.bottom, 20)
         }
-        .onChange(of: selection) { _, items in
+        .onChange(of: presentation.selection) { _, items in
             // Navigation follows a single selection only. A multi-selection is
             // for bulk actions (delete), so it must not yank the active project
             // or tab around as rows are added to the selection.
-            guard items.count == 1, let item = items.first else { return }
+            guard isInteractive, items.count == 1, let item = items.first else { return }
             switch item {
             case let .project(projectID):
                 guard let project = projectStore.projects.first(where: { $0.id == projectID }) else { return }
@@ -268,7 +283,7 @@ struct SidebarContent: View {
         }
         .onChange(of: appState.activeProjectID) { _, newID in
             if let newID, newID != PinnedTabs.projectID {
-                expandedProjects.insert(newID)
+                presentation.expandedProjects.insert(newID)
             }
             syncSelection()
         }
@@ -276,7 +291,7 @@ struct SidebarContent: View {
             syncSelection()
         }
         .onAppear {
-            if let id = appState.activeProjectID { expandedProjects.insert(id) }
+            if let id = appState.activeProjectID { presentation.expandedProjects.insert(id) }
             syncSelection()
         }
     }
@@ -298,6 +313,8 @@ struct SidebarContent: View {
                     tab: tab,
                     index: index + 1,
                     iconSymbolOverride: "pin",
+                    presentation: presentation,
+                    isInteractive: isInteractive,
                     onRename: { newName in
                         tab.customTitle = newName.isEmpty ? nil : newName
                         appState.saveWorkspaces()
@@ -320,6 +337,7 @@ struct SidebarContent: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
         .tag(SidebarItem.tab(projectID: PinnedTabs.projectID, tabID: record.id))
+        .id(SidebarItem.tab(projectID: PinnedTabs.projectID, tabID: record.id))
         // Dragging a pinned row into a project unpins it (AppState.moveTab
         // routes the record bookkeeping). Deliberately NO drop destination on
         // the row — same rule as `tabRow`: any row-level target claims the
@@ -349,8 +367,14 @@ struct SidebarContent: View {
         let ws = appState.workspaces[project.id]
         let tabs = ws?.tabs ?? []
         DisclosureGroup(isExpanded: Binding(
-            get: { expandedProjects.contains(project.id) },
-            set: { if $0 { expandedProjects.insert(project.id) } else { expandedProjects.remove(project.id) } }
+            get: { presentation.expandedProjects.contains(project.id) },
+            set: {
+                if $0 {
+                    presentation.expandedProjects.insert(project.id)
+                } else {
+                    presentation.expandedProjects.remove(project.id)
+                }
+            }
         )) {
             ForEach(Array(tabs.enumerated()), id: \.element.id) { tabIndex, tab in
                 tabRow(tab: tab, index: tabIndex, project: project)
@@ -375,12 +399,15 @@ struct SidebarContent: View {
         } label: {
             projectHeader(index: projectIndex, project: project)
         }
+        .id(SidebarItem.project(project.id))
     }
 
     private func tabRow(tab: TerminalTab, index tabIndex: Int, project: Project) -> some View {
         SidebarTabRow(
             tab: tab,
             index: tabIndex + 1,
+            presentation: presentation,
+            isInteractive: isInteractive,
             onRename: { newName in
                 tab.customTitle = newName.isEmpty ? nil : newName
                 appState.saveWorkspaces()
@@ -393,6 +420,7 @@ struct SidebarContent: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
         .tag(SidebarItem.tab(projectID: project.id, tabID: tab.id))
+        .id(SidebarItem.tab(projectID: project.id, tabID: tab.id))
         // Drag a tab out to another project (or reorder within this one). The
         // payload is just IDs — the live tab is looked up on drop, never
         // serialized.
@@ -408,7 +436,12 @@ struct SidebarContent: View {
     }
 
     private func projectHeader(index projectIndex: Int, project: Project) -> some View {
-        SidebarProjectRow(project: project, index: projectIndex + 1) {
+        SidebarProjectRow(
+            project: project,
+            index: projectIndex + 1,
+            presentation: presentation,
+            isInteractive: isInteractive
+        ) {
             projectStore.rename(id: project.id, to: $0)
         }
         .padding(.trailing, rowTrailingInset)
@@ -446,7 +479,7 @@ struct SidebarContent: View {
             // project drags (the union payload can't be inspected here); the
             // hovered header itself doesn't move when it expands, so the
             // drop stays on target.
-            if targeted { expandedProjects.insert(project.id) }
+            if targeted { presentation.expandedProjects.insert(project.id) }
         }
     }
 
@@ -476,7 +509,7 @@ struct SidebarContent: View {
                 )
             }
         }
-        expandedProjects.insert(project.id)
+        presentation.expandedProjects.insert(project.id)
     }
 
     /// Apply a pane drag-and-drop: the pane leaves its split tree and becomes
@@ -495,7 +528,7 @@ struct SidebarContent: View {
                 at: index
             )
         }
-        expandedProjects.insert(project.id)
+        presentation.expandedProjects.insert(project.id)
     }
 
     /// Apply a project drag-and-drop onto a section (header or tab row): move
@@ -523,11 +556,11 @@ struct SidebarContent: View {
               let ws = appState.workspaces[pid],
               let tabID = ws.activeTabID
         else {
-            selection = appState.activeProjectID.map { [.project($0)] } ?? []
+            presentation.selection = appState.activeProjectID.map { [.project($0)] } ?? []
             return
         }
         let desired: Set<SidebarItem> = [.tab(projectID: pid, tabID: tabID)]
-        if selection != desired { selection = desired }
+        if presentation.selection != desired { presentation.selection = desired }
     }
 
     // MARK: - Context menu
@@ -573,14 +606,14 @@ struct SidebarContent: View {
         Button("New Tab") {
             appState.selectProject(project)
             appState.createTab(projectID: project.id, projectPath: project.path)
-            expandedProjects.insert(project.id)
+            presentation.expandedProjects.insert(project.id)
         }
         Button("Copy Path") {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(project.path, forType: .string)
         }
         Divider()
-        Button("Rename Project") { appState.renamingProjectID = project.id }
+        Button("Rename Project") { requestProjectRename(project.id) }
         Divider()
         // Same reorder calls as Settings → Projects' rows; `toOffset` is in
         // `move(fromOffsets:toOffset:)` convention, hence `+ 2` for down.
@@ -610,7 +643,7 @@ struct SidebarContent: View {
     private func pinnedTabMenu(record: PinnedTabRecord) -> some View {
         let isLoaded = appState.isPinnedTabLoaded(record.id)
         if isLoaded {
-            Button("Rename Tab") { appState.renamingTabID = record.id }
+            Button("Rename Tab") { requestTabRename(record.id) }
             if let tab = appState.pinnedWorkspace?.tabs.first(where: { $0.id == record.id }),
                tab.splitRoot.allPanes().count > 1
             {
@@ -639,7 +672,7 @@ struct SidebarContent: View {
                             to: destination.id,
                             destPath: destination.path
                         )
-                        expandedProjects.insert(destination.id)
+                        presentation.expandedProjects.insert(destination.id)
                     }
                 }
             }
@@ -664,7 +697,7 @@ struct SidebarContent: View {
 
     @ViewBuilder
     private func tabMenu(project: Project, tab: TerminalTab) -> some View {
-        Button("Rename Tab") { appState.renamingTabID = tab.id }
+        Button("Rename Tab") { requestTabRename(tab.id) }
         if tab.splitRoot.allPanes().count > 1 {
             // #227: explode a split tab — every pane after the first opens in
             // its own tab, shells intact.
@@ -689,7 +722,7 @@ struct SidebarContent: View {
                 ForEach(moveTargets) { destination in
                     Button(destination.name) {
                         appState.moveTab(tab.id, from: project.id, to: destination.id, destPath: destination.path)
-                        expandedProjects.insert(destination.id)
+                        presentation.expandedProjects.insert(destination.id)
                     }
                 }
             }
@@ -720,7 +753,7 @@ struct SidebarContent: View {
     /// and collapse its disclosure. Shared by the single-item menu and the
     /// bulk path so both prune identically.
     private func removeProject(_ project: Project) {
-        expandedProjects.remove(project.id)
+        presentation.expandedProjects.remove(project.id)
         appState.removeProject(project.id)
         projectStore.remove(id: project.id)
     }
@@ -754,36 +787,47 @@ struct SidebarContent: View {
             for project in projects {
                 removeProject(project)
             }
-            selection = []
+            presentation.selection = []
         }
     }
 
     private func openProject() {
         if let project = appState.openProject(store: projectStore) {
-            expandedProjects.insert(project.id)
+            presentation.expandedProjects.insert(project.id)
         }
+    }
+
+    private func requestProjectRename(_ projectID: UUID) {
+        appState.sidebarVisible = true
+        DispatchQueue.main.async { appState.renamingProjectID = projectID }
+    }
+
+    private func requestTabRename(_ tabID: UUID) {
+        appState.sidebarVisible = true
+        DispatchQueue.main.async { appState.renamingTabID = tabID }
     }
 }
 
 private struct SidebarProjectRow: View {
     let project: Project
     let index: Int
+    @Bindable
+    var presentation: SidebarPresentationState
+    let isInteractive: Bool
     let onRename: (String) -> Void
     @Environment(AppState.self)
     private var appState
     @AppStorage(Preferences.Keys.projectIconSymbol)
     private var projectIconSymbol = "folder"
-    @State
-    private var isRenaming = false
-    @State
-    private var renameText = ""
     @FocusState
     private var focused: Bool
 
+    private var renameTarget: SidebarRenameTarget { .project(project.id) }
+
     @ViewBuilder
     private var titleContent: some View {
-        if isRenaming {
-            TextField("", text: $renameText)
+        if isInteractive, presentation.isRenaming(renameTarget) {
+            TextField("", text: $presentation.renameText)
                 .textFieldStyle(.plain)
                 .focused($focused)
                 .onSubmit { commit() }
@@ -822,20 +866,23 @@ private struct SidebarProjectRow: View {
     }
 
     private func beginRename() {
+        guard isInteractive else { return }
+        presentation.beginRename(
+            renameTarget,
+            text: project.name
+        )
         appState.renamingProjectID = nil
-        renameText = project.name
-        isRenaming = true
     }
 
     private func commit() {
-        let text = renameText.trimmingCharacters(in: .whitespaces)
+        guard let draft = presentation.completeRename(renameTarget) else { return }
+        let text = draft.text.trimmingCharacters(in: .whitespaces)
         if !text.isEmpty { onRename(text) }
-        isRenaming = false
         appState.restoreFocusToActivePane()
     }
 
     private func cancelRename() {
-        isRenaming = false
+        guard presentation.cancelRename(renameTarget) else { return }
         appState.restoreFocusToActivePane()
     }
 }
@@ -846,6 +893,9 @@ private struct SidebarTabRow: View {
     /// Fixed icon overriding the user's `tabIconSymbol` preference — the
     /// pinned rows pass "pin" so the icon itself marks the row's kind.
     var iconSymbolOverride: String?
+    @Bindable
+    var presentation: SidebarPresentationState
+    let isInteractive: Bool
     let onRename: (String) -> Void
     @Environment(AppState.self)
     private var appState
@@ -857,19 +907,15 @@ private struct SidebarTabRow: View {
     private var showTabStatusIndicator = false
     @AppStorage(Preferences.Keys.showSpinnerOverAgentIcons)
     private var showSpinnerOverAgentIcons = true
-    @State
-    private var isRenaming = false
-    @State
-    private var renameText = ""
-    @State
-    private var preEditCustomTitle: String?
     @FocusState
     private var focused: Bool
 
+    private var renameTarget: SidebarRenameTarget { .tab(tab.id) }
+
     @ViewBuilder
     private var titleContent: some View {
-        if isRenaming {
-            TextField(tab.autoTitle, text: $renameText)
+        if isInteractive, presentation.isRenaming(renameTarget) {
+            TextField(tab.autoTitle, text: $presentation.renameText)
                 .textFieldStyle(.plain)
                 .focused($focused)
                 .onSubmit { commit() }
@@ -943,24 +989,27 @@ private struct SidebarTabRow: View {
     }
 
     private func beginRename() {
+        guard isInteractive else { return }
+        presentation.beginRename(
+            renameTarget,
+            text: tab.customTitle ?? "",
+            originalCustomTitle: tab.customTitle
+        )
         appState.renamingTabID = nil
-        preEditCustomTitle = tab.customTitle
-        renameText = tab.customTitle ?? ""
-        isRenaming = true
     }
 
     private func commit() {
-        let text = renameText.trimmingCharacters(in: .whitespaces)
+        guard let draft = presentation.completeRename(renameTarget) else { return }
+        let text = draft.text.trimmingCharacters(in: .whitespaces)
         let newCustomTitle: String? = text.isEmpty ? nil : text
-        if newCustomTitle != preEditCustomTitle {
+        if newCustomTitle != draft.originalCustomTitle {
             onRename(text)
         }
-        isRenaming = false
         appState.restoreFocusToActivePane()
     }
 
     private func cancelRename() {
-        isRenaming = false
+        guard presentation.cancelRename(renameTarget) else { return }
         appState.restoreFocusToActivePane()
     }
 }

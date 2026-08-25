@@ -305,6 +305,17 @@ enum WindowAppearance {
     /// user drag owns and which the peek's expand restores.
     private static var didRestoreSidebarWidth = false
 
+    /// The actual native sidebar state after AppKit has restored its split-view
+    /// autosave. SwiftUI's `columnVisibility` binding can still say `.automatic`
+    /// while this item is collapsed, so launch-time hover must synchronize from
+    /// this native value rather than trusting the binding.
+    static func sidebarIsVisible(window: NSWindow) -> Bool? {
+        guard let split = window.contentView?.firstSplitView,
+              let sidebar = split.owningSplitViewController?.splitViewItems.first
+        else { return nil }
+        return !sidebar.isCollapsed
+    }
+
     private static func restoreSidebarWidth(window: NSWindow) {
         guard !didRestoreSidebarWidth,
               let split = window.contentView?.firstSplitView,
@@ -325,6 +336,27 @@ enum WindowAppearance {
         let width = CGFloat(Preferences.shared.launchSidebarWidth)
         split.setPosition(width, ofDividerAt: 0)
         logger.info("sidebar width restored to \(width, privacy: .public)")
+    }
+
+    /// Move the live main-window sidebar divider to an explicit width.
+    ///
+    /// The overlay uses the same persisted width as the native column, but the
+    /// split view also keeps an independent in-session metric. Applying the
+    /// overlay's width when it is promoted prevents that stale metric from
+    /// winning and writing itself back through `MainWindow`'s geometry hook.
+    @discardableResult
+    static func setSidebarWidth(_ width: CGFloat, window: NSWindow) -> Bool {
+        guard let split = window.contentView?.firstSplitView,
+              split.arrangedSubviews.count > 1,
+              let sidebar = split.owningSplitViewController?.splitViewItems.first,
+              !sidebar.isCollapsed
+        else { return false }
+
+        let range = Preferences.sidebarWidthRange
+        let clamped = min(max(width, CGFloat(range.lowerBound)), CGFloat(range.upperBound))
+        sidebar.maximumThickness = CGFloat(range.upperBound)
+        split.setPosition(clamped, ofDividerAt: 0)
+        return true
     }
 
     /// Cap the sidebar column at `Preferences.sidebarWidthRange`'s upper bound.

@@ -11,6 +11,18 @@ import Testing
 @MainActor
 struct PreferencesTests {
     @Test
+    func sidebar_peek_style_round_trips() {
+        let prior = Preferences.shared.sidebarPeekStyle
+        defer { Preferences.shared.sidebarPeekStyle = prior }
+
+        Preferences.shared.sidebarPeekStyle = .overlayTerminal
+        #expect(Preferences.defaults.string(forKey: Preferences.Keys.sidebarPeekStyle) == "overlay_on_hover")
+
+        Preferences.shared.sidebarPeekStyle = .resizeTerminal
+        #expect(Preferences.defaults.string(forKey: Preferences.Keys.sidebarPeekStyle) == "resize_content")
+    }
+
+    @Test
     func reconnect_remote_panes_defaults_on_and_round_trips() {
         let prior = Preferences.shared.reconnectRemotePanes
         defer { Preferences.shared.reconnectRemotePanes = prior }
