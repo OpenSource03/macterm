@@ -84,9 +84,13 @@ final class GhosttyApp {
         rt.supports_selection_clipboard = true
         rt.wakeup_cb = { _ in GhosttyApp.shared.callbacks.wakeup() }
         rt.action_cb = { _, target, action in GhosttyApp.shared.callbacks.action(target: target, action: action) }
-        rt.read_clipboard_cb = { ud, loc, state in GhosttyApp.shared.callbacks.readClipboard(ud: ud, location: loc, state: state) }
-        rt.confirm_read_clipboard_cb = { ud, content, state, _ in
-            GhosttyApp.shared.callbacks.confirmReadClipboard(ud: ud, content: content, state: state)
+        rt.read_clipboard_cb = { ud, _, state, mimes, mimesLen, list in
+            GhosttyApp.shared.callbacks.readClipboard(
+                ud: ud, state: state, mimes: mimes, mimesLen: mimesLen, list: list
+            )
+        }
+        rt.confirm_read_clipboard_cb = { ud, confirm, state, _ in
+            GhosttyApp.shared.callbacks.confirmReadClipboard(ud: ud, confirm: confirm, state: state)
         }
         rt.write_clipboard_cb = { _, loc, content, len, confirm in
             GhosttyApp.shared.callbacks.writeClipboard(
@@ -445,8 +449,9 @@ final class GhosttyApp {
         //   2. User's Ghostty config files, overriding any default. In automatic
         //      mode, libghostty loads its default roots.
         //   3. Macterm overrides — keys Macterm absolutely needs to control,
-        //      currently just background-opacity/blur for the window-level
-        //      translucency contract. Loaded last so it overrides the user.
+        //      currently the background keys for the window-level translucency
+        //      contract (default-background paint, opacity value, blur).
+        //      Loaded last so it overrides the user.
         // libghostty merges last-wins, so this ordering produces:
         //   Macterm defaults < user's Ghostty config < Macterm overrides
         MactermConfig.shared.defaultsPath.withCString { ghostty_config_load_file(cfg, $0) }
