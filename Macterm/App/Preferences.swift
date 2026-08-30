@@ -26,13 +26,23 @@ enum TabSwitcherVisibility: String, CaseIterable, Identifiable {
 /// Which Sparkle appcast channel the updater draws from.
 ///
 /// `stable` maps to Sparkle's default channel (items with no
-/// `<sparkle:channel>`); `beta` additionally allows items tagged
-/// `<sparkle:channel>beta</sparkle:channel>`. The raw values are persisted, so
-/// renaming a case is a stored-preference migration — and `beta`'s raw value is
-/// the channel name sent to Sparkle, matching `betaUpdateChannel`.
+/// `<sparkle:channel>`); `beta` and `tip` additionally allow items tagged with
+/// the matching `<sparkle:channel>`. The raw values are persisted, so renaming a
+/// case is a stored-preference migration — and every non-stable case's raw value
+/// IS the channel name sent to Sparkle (see `betaUpdateChannel` /
+/// `tipUpdateChannel`), so it is a wire-format migration too.
+///
+/// Sparkle always admits the default channel on top of whatever
+/// `allowedChannels` returns, so a beta or tip follower still sees stable items.
+/// That is harmless because the comparison versions can't collide: a beta sorts
+/// below the stable release of the same `X.Y.Z` and a tip sorts above it (see
+/// `sparkle_comparison_version` in scripts/_lib.sh).
 enum UpdateChannel: String, CaseIterable, Identifiable {
     case stable
     case beta
+    /// Every commit on main that passes CI, built and published by
+    /// `.github/workflows/release-tip.yml`. Not release-tested.
+    case tip
 
     var id: String { rawValue }
 
@@ -40,6 +50,58 @@ enum UpdateChannel: String, CaseIterable, Identifiable {
         switch self {
         case .stable: "Stable"
         case .beta: "Beta"
+        case .tip: "Tip"
+        }
+    }
+
+    /// The channel this BUILD was cut for, baked into `Info.plist` as
+    /// `MactermUpdateChannel` by `scripts/build.sh`. Used as the default when
+    /// the user has never chosen a channel.
+    ///
+    /// This exists for tip specifically. A tip DMG downloaded by hand from the
+    /// rolling `tip` release would otherwise sit on `stable`, and because a tip
+    /// version outranks every stable release of the same base, Sparkle would
+    /// report "You're up to date" forever — a silent dead end. A beta needs no
+    /// such treatment (it sorts *below* its stable, so the stable release still
+    /// reaches it), which is why `macterm_update_channel` in scripts/_lib.sh
+    /// only ever stamps `tip` or `stable`.
+    static var bundleDefault: UpdateChannel {
+        (Bundle.main.object(forInfoDictionaryKey: "MactermUpdateChannel") as? String)
+            .flatMap(UpdateChannel.init(rawValue:)) ?? .stable
+    }
+}
+
+/// How large the leading glyph on a sidebar project/tab row draws, relative to
+/// the row's text. `medium` is the system default: the SF Symbols take
+/// whatever size the row's ambient font gives them, exactly as they did before
+/// this preference existed, so it is the one case that applies no sizing at
+/// all. The raw values are persisted.
+enum SidebarIconSize: String, CaseIterable, Identifiable {
+    case small
+    case medium
+    case large
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .small: "Small"
+        case .medium: "Medium"
+        case .large: "Large"
+        }
+    }
+
+    /// Multiplier for the sidebar glyphs sized by hand rather than by SwiftUI's
+    /// `imageScale` — the agent logo's frame, the plain-digit number glyph, the
+    /// running spinner, the completion dot. Taken from AppKit rather than
+    /// guessed so those glyphs track the SF Symbols beside them instead of
+    /// drifting: `NSImage.SymbolConfiguration` renders a 13pt symbol 12/14/18pt
+    /// tall at small/medium/large.
+    var glyphScale: CGFloat {
+        switch self {
+        case .small: 12.0 / 14.0
+        case .medium: 1
+        case .large: 18.0 / 14.0
         }
     }
 }
@@ -152,12 +214,6 @@ final class Preferences {
         didSet { defaults.set(terminalScrollSpeed, forKey: Keys.terminalScrollSpeed) }
     }
 
-    /// How dark the overlay on an unfocused split pane gets (0–0.8, 0 = no dimming).
-    /// Capped below 1 so an unfocused pane is never fully black.
-    var paneDimOpacity: Double {
-        didSet { defaults.set(paneDimOpacity, forKey: Keys.paneDimOpacity) }
-    }
-
     /// Presentation used by `peekSidebarWhenHidden`. The pinned sidebar is
     /// always the native split-view column.
     var sidebarPeekStyle: SidebarPeekStyle {
@@ -172,6 +228,11 @@ final class Preferences {
 
     var tabIconSymbol: String {
         didSet { defaults.set(tabIconSymbol, forKey: Keys.tabIconSymbol) }
+    }
+
+    /// How large the leading glyph on project and tab rows draws.
+    var sidebarIconSize: SidebarIconSize {
+        didSet { defaults.set(sidebarIconSize.rawValue, forKey: Keys.sidebarIconSize) }
     }
 
     /// Replace a tab's icon with the running AI agent's logo (Claude Code,
@@ -280,9 +341,13 @@ final class Preferences {
     static let defaultSidebarWidth: Double = 180
 
     /// Which appcast channel auto-updates come from. Read by `Updater`'s
-    /// `allowedChannelsForUpdater`, so `.beta` makes prerelease items visible to
-    /// both the scheduled check and "Check for Updates…". Defaults to `.stable`:
-    /// the only channel a fresh install ever sees.
+    /// `allowedChannels(for:)`, so `.beta`/`.tip` make the matching prerelease
+    /// items visible to both the scheduled check and "Check for Updates…".
+    ///
+    /// Defaults to `UpdateChannel.bundleDefault`, which is `.stable` for every
+    /// build except a tip one — so a fresh install of a stable or beta DMG never
+    /// sees anything but stable, while a hand-installed tip DMG follows tip
+    /// instead of dead-ending (see `bundleDefault`).
     ///
     /// Sparkle reads `allowedChannels` fresh on every check, so changing this
     /// takes effect on the next check with no restart.
@@ -338,9 +403,6 @@ final class Preferences {
         numberIconPlain,
     ]
 
-    /// Upper bound for `paneDimOpacity` — a fully black overlay reads as broken, not dim.
-    static let maxPaneDimOpacity: Double = 0.8
-
     /// Curated SF Symbols offered in Settings — keeps users from typing invalid names.
     static let projectIconChoices: [String] = [
         noIcon,
@@ -373,15 +435,20 @@ final class Preferences {
 
     // MARK: - Window
 
-    /// Macterm-painted window background opacity (0–1). Independent from
-    /// ghostty's renderer — `macterm-overrides.conf` pins `background-opacity
-    /// = 0` so ghostty draws fully transparent, then Macterm composites this
-    /// translucency at the window level. Avoids the double-paint problem when
-    /// both layers tint.
+    /// Macterm-painted window background opacity (0–1). Macterm composites
+    /// this translucency at the window level while `macterm-overrides.conf`
+    /// sets `background-default-transparent` so ghostty never paints the
+    /// default background — avoiding the double-paint problem when both
+    /// layers tint. The value is also written into the overrides as
+    /// `background-opacity`, which ghostty applies to TUI-painted cell
+    /// backgrounds when the user's own `background-opacity-cells` flag is
+    /// on — hence the debounced config reload alongside the instant window
+    /// resync.
     var windowOpacity: Double {
         didSet {
             defaults.set(windowOpacity, forKey: Keys.windowOpacity)
             notifyWindowAppearanceChanged()
+            scheduleGhosttyConfigReload()
         }
     }
 
@@ -482,14 +549,34 @@ final class Preferences {
 
     /// Notify observers that a WINDOW-APPEARANCE pref (opacity/blur/glass)
     /// changed, WITHOUT regenerating the ghostty config or reloading libghostty.
-    /// Those values don't appear in the regenerated files (`background-opacity`
-    /// is pinned to 0 unconditionally) — `WindowAppearance.sync` reads them
-    /// straight from Preferences. Previously these setters ran the full
-    /// `notifyConfigChanged()` (two file writes + a whole-config libghostty
-    /// reload) purely to piggy-back on the `.mactermConfigDidChange` post it
-    /// ends with — heavyweight, and fired continuously while dragging a slider.
+    /// `WindowAppearance.sync` reads these values straight from Preferences.
+    /// Previously these setters ran the full `notifyConfigChanged()` (two file
+    /// writes + a whole-config libghostty reload) purely to piggy-back on the
+    /// `.mactermConfigDidChange` post it ends with — heavyweight, and fired
+    /// continuously while dragging a slider.
+    ///
+    /// One value DOES also live in the regenerated overrides: `windowOpacity`
+    /// is written as ghostty's `background-opacity` (so the user's
+    /// `background-opacity-cells` makes painted cells translucent at the
+    /// window opacity). That side is followed by `scheduleGhosttyConfigReload`
+    /// below — debounced, so slider drags stay on this cheap path and the
+    /// libghostty reload fires once after the value settles.
     private func notifyWindowAppearanceChanged() {
         NotificationCenter.default.post(name: .mactermConfigDidChange, object: nil)
+    }
+
+    /// The pending debounced reload for `windowOpacity`'s ghostty-side copy.
+    @ObservationIgnored private var ghosttyOpacityReloadTask: Task<Void, Never>?
+
+    /// Regenerate + reload the ghostty config shortly after the last call,
+    /// so a slider drag costs one whole-config reload instead of dozens.
+    private func scheduleGhosttyConfigReload() {
+        ghosttyOpacityReloadTask?.cancel()
+        ghosttyOpacityReloadTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(250))
+            guard !Task.isCancelled else { return }
+            self?.notifyConfigChanged()
+        }
     }
 
     // MARK: - Quick terminal
@@ -603,9 +690,6 @@ final class Preferences {
         self.defaults = defaults
         autoTilingEnabled = defaults.bool(forKey: Keys.autoTiling)
         terminalScrollSpeed = Self.clampScrollSpeed(defaults.double(forKey: Keys.terminalScrollSpeed), fallback: 1.0)
-        paneDimOpacity = Self.clampPaneDimOpacity(
-            (defaults.object(forKey: Keys.paneDimOpacity) as? Double) ?? 0.2
-        )
         sidebarPeekStyle = (defaults.string(forKey: Keys.sidebarPeekStyle))
             .flatMap(SidebarPeekStyle.init(rawValue:)) ?? .resizeTerminal
         windowOpacity = (defaults.object(forKey: Keys.windowOpacity) as? Double) ?? 1.0
@@ -648,6 +732,8 @@ final class Preferences {
         activeProjectID = (defaults.string(forKey: Keys.activeProjectID)).flatMap(UUID.init)
         projectIconSymbol = defaults.string(forKey: Keys.projectIconSymbol) ?? "folder"
         tabIconSymbol = defaults.string(forKey: Keys.tabIconSymbol) ?? "terminal"
+        sidebarIconSize = (defaults.string(forKey: Keys.sidebarIconSize))
+            .flatMap(SidebarIconSize.init(rawValue:)) ?? .medium
         showAgentIcons = defaults.object(forKey: Keys.showAgentIcons) as? Bool ?? true
         showTabStatusIndicator = defaults.object(forKey: Keys.showTabStatusIndicator) as? Bool ?? false
         showSpinnerOverAgentIcons = defaults.object(forKey: Keys.showSpinnerOverAgentIcons) as? Bool ?? true
@@ -660,7 +746,7 @@ final class Preferences {
         sidebarWidth = storedSidebarWidth
         launchSidebarWidth = storedSidebarWidth
         updateChannel = (defaults.string(forKey: Keys.updateChannel))
-            .flatMap(UpdateChannel.init(rawValue:)) ?? .stable
+            .flatMap(UpdateChannel.init(rawValue:)) ?? UpdateChannel.bundleDefault
         tabSwitcherVisibility = (defaults.string(forKey: Keys.tabSwitcherVisibility))
             .flatMap(TabSwitcherVisibility.init(rawValue:)) ?? .whenMultiple
         tabSwitcherPosition = (defaults.string(forKey: Keys.tabSwitcherPosition))
@@ -685,10 +771,6 @@ final class Preferences {
     static func clampSidebarWidth(_ v: Double?) -> Double {
         guard let v, v > 0 else { return defaultSidebarWidth }
         return min(max(v, sidebarWidthRange.lowerBound), sidebarWidthRange.upperBound)
-    }
-
-    private static func clampPaneDimOpacity(_ v: Double) -> Double {
-        max(0.0, min(maxPaneDimOpacity, v))
     }
 
     private static func clampScrollSpeed(_ v: Double, fallback: Double) -> Double {
@@ -718,6 +800,13 @@ final class Preferences {
             defaults.removeObject(forKey: "macterm.session.terminateOnQuit")
             defaults.set(true, forKey: Keys.migrationRetiredToggleKeys)
         }
+        // The unfocused-split dim is now driven by the user's ghostty config
+        // (`unfocused-split-opacity` / `unfocused-split-fill`), so the
+        // Macterm-side slider key is dead.
+        if !defaults.bool(forKey: Keys.migrationRetiredPaneDimKey) {
+            defaults.removeObject(forKey: "macterm.pane.dimOpacity")
+            defaults.set(true, forKey: Keys.migrationRetiredPaneDimKey)
+        }
     }
 
     /// Reads the two-layer config preference. The single-path key came from the
@@ -746,7 +835,6 @@ final class Preferences {
     enum Keys {
         static let autoTiling = "macterm.autoTiling.enabled"
         static let terminalScrollSpeed = "macterm.terminal.scrollSpeed"
-        static let paneDimOpacity = "macterm.pane.dimOpacity"
         static let sidebarPeekStyle = "macterm.sidebar.presentation"
         static let windowOpacity = "macterm.window.opacity"
         static let windowBlurRadius = "macterm.window.blurRadius"
@@ -772,6 +860,7 @@ final class Preferences {
         static let activeProjectID = "macterm.activeProjectID"
         static let projectIconSymbol = "macterm.sidebar.projectIcon"
         static let tabIconSymbol = "macterm.sidebar.tabIcon"
+        static let sidebarIconSize = "macterm.sidebar.iconSize"
         static let showAgentIcons = "macterm.sidebar.showAgentIcons"
         static let showTabStatusIndicator = "macterm.sidebar.showTabStatusIndicator"
         static let showSpinnerOverAgentIcons = "macterm.sidebar.showSpinnerOverAgentIcons"
@@ -787,5 +876,6 @@ final class Preferences {
         static let tabSwitcherPosition = "macterm.toolbar.tabSwitcherPosition"
         static let migrationV2GhosttyConfigOwned = "macterm.migration.v2_ghostty_config_owned"
         static let migrationRetiredToggleKeys = "macterm.migration.retired_toggle_keys"
+        static let migrationRetiredPaneDimKey = "macterm.migration.retired_pane_dim_key"
     }
 }

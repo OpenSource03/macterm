@@ -84,9 +84,13 @@ final class GhosttyApp {
         rt.supports_selection_clipboard = true
         rt.wakeup_cb = { _ in GhosttyApp.shared.callbacks.wakeup() }
         rt.action_cb = { _, target, action in GhosttyApp.shared.callbacks.action(target: target, action: action) }
-        rt.read_clipboard_cb = { ud, loc, state in GhosttyApp.shared.callbacks.readClipboard(ud: ud, location: loc, state: state) }
-        rt.confirm_read_clipboard_cb = { ud, content, state, _ in
-            GhosttyApp.shared.callbacks.confirmReadClipboard(ud: ud, content: content, state: state)
+        rt.read_clipboard_cb = { ud, _, state, mimes, mimesLen, list in
+            GhosttyApp.shared.callbacks.readClipboard(
+                ud: ud, state: state, mimes: mimes, mimesLen: mimesLen, list: list
+            )
+        }
+        rt.confirm_read_clipboard_cb = { ud, confirm, state, _ in
+            GhosttyApp.shared.callbacks.confirmReadClipboard(ud: ud, confirm: confirm, state: state)
         }
         rt.write_clipboard_cb = { _, loc, content, len, confirm in
             GhosttyApp.shared.callbacks.writeClipboard(
@@ -296,6 +300,13 @@ final class GhosttyApp {
         return configColor("background") ?? NSColor(srgbRed: 0.11, green: 0.11, blue: 0.14, alpha: 1)
     }
 
+    /// The color space the renderer paints in (the user's
+    /// `window-colorspace`). Sampled pixels and OSC 11 colors have to be
+    /// interpreted in it — see `GhosttyColorSpace`.
+    var surfaceColorSpace: NSColorSpace {
+        GhosttyColorSpace.resolve(userConfigText: MactermConfig.userGhosttyConfigText())
+    }
+
     var effectiveBackgroundColor: NSColor {
         adaptiveBackgroundColor ?? backgroundColor
     }
@@ -320,6 +331,27 @@ final class GhosttyApp {
             $0.withMemoryRebound(to: ghostty_config_color_s.self, capacity: 256) { $0[index] }
         }
         return NSColor(srgbRed: CGFloat(c.r) / 255, green: CGFloat(c.g) / 255, blue: CGFloat(c.b) / 255, alpha: 1)
+    }
+
+    /// The alpha of the overlay that dims an unfocused split pane, derived
+    /// from the user's `unfocused-split-opacity`. Ghostty defines that key as
+    /// the unfocused *pane's* opacity (1 = no dimming; libghostty clamps it to
+    /// 0.15…1 at load), so the overlay draws at its complement — the same
+    /// reading Ghostty.app applies.
+    var unfocusedSplitDimOpacity: Double {
+        guard let config else { return 0 }
+        var opacity = 1.0
+        let key = "unfocused-split-opacity"
+        guard ghostty_config_get(config, &opacity, key, UInt(key.utf8.count)) else { return 0 }
+        return 1 - opacity
+    }
+
+    /// The color of that overlay (`unfocused-split-fill`). The key is unset by
+    /// default and Ghostty falls back to the theme background, so the dim
+    /// reads as the pane fading toward the background — correct on light and
+    /// dark themes alike.
+    var unfocusedSplitFill: NSColor {
+        configColor("unfocused-split-fill") ?? backgroundColor
     }
 
     private func configColor(_ key: String) -> NSColor? {
@@ -424,8 +456,9 @@ final class GhosttyApp {
         //   2. User's Ghostty config files, overriding any default. In automatic
         //      mode, libghostty loads its default roots.
         //   3. Macterm overrides — keys Macterm absolutely needs to control,
-        //      currently just background-opacity/blur for the window-level
-        //      translucency contract. Loaded last so it overrides the user.
+        //      currently the background keys for the window-level translucency
+        //      contract (default-background paint, opacity value, blur).
+        //      Loaded last so it overrides the user.
         // libghostty merges last-wins, so this ordering produces:
         //   Macterm defaults < user's Ghostty config < Macterm overrides
         MactermConfig.shared.defaultsPath.withCString { ghostty_config_load_file(cfg, $0) }

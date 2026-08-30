@@ -1027,6 +1027,7 @@ private struct AppearanceSettings: View {
     // not `@AppStorage`, which would bind to the banned `UserDefaults.standard`.
     @State private var projectIconSymbol: String = Preferences.shared.projectIconSymbol
     @State private var tabIconSymbol: String = Preferences.shared.tabIconSymbol
+    @State private var sidebarIconSize: String = Preferences.shared.sidebarIconSize.rawValue
     @State private var showAgentIcons: Bool = Preferences.shared.showAgentIcons
     @State private var showTabStatusIndicator: Bool = Preferences.shared.showTabStatusIndicator
     @State private var showSpinnerOverAgentIcons: Bool = Preferences.shared.showSpinnerOverAgentIcons
@@ -1043,8 +1044,6 @@ private struct AppearanceSettings: View {
     private var liquidGlass: Bool = Preferences.shared.windowGlassEnabled
     @State
     private var liquidGlassStyle: WindowGlassStyle = Preferences.shared.windowGlassStyle
-    @State
-    private var paneDimOpacity: Double = Preferences.shared.paneDimOpacity
     @State
     private var adaptiveTerminalChrome: Bool = Preferences.shared.adaptiveTerminalChromeEnabled
     @State
@@ -1098,30 +1097,12 @@ private struct AppearanceSettings: View {
 
                 Text(blurFootnote)
                     .settingsCaption()
-            }
 
-            Section("Terminal") {
-                Toggle("Match terminal app backgrounds", isOn: $adaptiveTerminalChrome)
+                Toggle("Adaptive background", isOn: $adaptiveTerminalChrome)
                     .onChange(of: adaptiveTerminalChrome) { _, enabled in
                         Preferences.shared.adaptiveTerminalChromeEnabled = enabled
                     }
                 Text("Matches the whole window for a single pane; in a split, only each full-screen app's pane changes color.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            Section("Split Panes") {
-                SettingsSlider(
-                    label: "Unfocused dimming",
-                    value: $paneDimOpacity,
-                    range: 0.0 ... Preferences.maxPaneDimOpacity,
-                    step: nil,
-                    display: { "\(Int(($0 / Preferences.maxPaneDimOpacity * 100).rounded()))%" }
-                )
-                .onChange(of: paneDimOpacity) { _, v in
-                    Preferences.shared.paneDimOpacity = v
-                }
-                Text("How dark unfocused panes get in a split layout.")
                     .settingsCaption()
             }
 
@@ -1158,6 +1139,15 @@ private struct AppearanceSettings: View {
                     }
                 }
                 .onChange(of: tabIconSymbol) { _, v in Preferences.shared.tabIconSymbol = v }
+
+                Picker("Icon size", selection: $sidebarIconSize) {
+                    ForEach(SidebarIconSize.allCases) { option in
+                        Text(option.displayName).tag(option.rawValue)
+                    }
+                }
+                .onChange(of: sidebarIconSize) { _, v in
+                    Preferences.shared.sidebarIconSize = SidebarIconSize(rawValue: v) ?? .medium
+                }
 
                 Toggle("Auto-name tabs", isOn: $autoNameTabs)
                     .onChange(of: autoNameTabs) { _, v in
@@ -1736,6 +1726,9 @@ private struct UpdatesSettings: View {
                 .onChange(of: updateChannel) { _, v in
                     updater.updateChannel = UpdateChannel(rawValue: v) ?? .stable
                 }
+
+                Text("Tip builds come from every commit that passes CI and are not release-tested.")
+                    .settingsCaption()
             }
 
             Section("Version") {

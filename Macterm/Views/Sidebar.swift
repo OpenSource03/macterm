@@ -329,7 +329,11 @@ struct SidebarContent: View {
                     FadingText(record.displayTitle)
                         .foregroundStyle(.secondary)
                 } icon: {
-                    Image(systemName: "pin.slash")
+                    // The pin stays as-is — the row is still pinned, it just
+                    // isn't running; the dimming is what says so. Swapping in
+                    // `pin.slash` read as "unpinned", which is the one thing
+                    // closing a pinned tab never does.
+                    Image(systemName: "pin")
                         .foregroundStyle(.tertiary)
                 }
                 .help("Not running — select to restore from its saved layout")
@@ -410,6 +414,10 @@ struct SidebarContent: View {
             index: tabIndex + 1,
             presentation: presentation,
             isInteractive: isInteractive,
+            // An unloaded project keeps its tabs as a layout with no shells
+            // behind them — the same state a closed pinned tab is in, so it
+            // gets the same dimmed treatment.
+            isUnloaded: appState.isProjectUnloaded(project.id),
             onRename: { newName in
                 tab.customTitle = newName.isEmpty ? nil : newName
                 appState.saveWorkspaces()
@@ -898,6 +906,10 @@ private struct SidebarTabRow: View {
     @Bindable
     var presentation: SidebarPresentationState
     let isInteractive: Bool
+    /// Dim the row: the tab is a layout with no shells behind it (its project
+    /// was unloaded). Matches the unloaded pinned row's treatment — secondary
+    /// title, tertiary icon, and a tooltip saying what selecting it does.
+    var isUnloaded = false
     let onRename: (String) -> Void
     @Environment(AppState.self)
     private var appState
@@ -988,6 +1000,10 @@ private struct SidebarTabRow: View {
         .onChange(of: appState.renamingTabID) { _, id in
             if id == tab.id { beginRename() }
         }
+        // Applied only when unloaded: a live row must inherit the List's own
+        // styling, and forcing `.primary` back would flatten the white label
+        // AppKit gives a selected row.
+        .modifier(UnloadedRowStyle(isUnloaded: isUnloaded))
     }
 
     private func beginRename() {
@@ -1081,6 +1097,23 @@ private struct PinTabDropZone: View {
 /// won't fit legibly, so that row collapses back to a single title with the
 /// pane count (see `sidebarRowTitle`). The segments are a TITLE variant, not
 /// their own labels: the row carries one tab icon regardless.
+/// The dimmed treatment shared by every "not running" sidebar row: a tab
+/// whose project was unloaded, and — spelled out inline, since it has no live
+/// tab to render — a closed pinned tab.
+private struct UnloadedRowStyle: ViewModifier {
+    let isUnloaded: Bool
+
+    func body(content: Content) -> some View {
+        if isUnloaded {
+            content
+                .foregroundStyle(.secondary)
+                .help("Not running — select to load the project again")
+        } else {
+            content
+        }
+    }
+}
+
 private struct TabRowTitle: View {
     let tab: TerminalTab
 
@@ -1119,6 +1152,20 @@ private struct TabStatusGlyph: View {
     let index: Int
     var agent: AgentIcon?
     var spinnerOverAgent = true
+    @AppStorage(Preferences.Keys.sidebarIconSize)
+    private var iconSizeRaw = SidebarIconSize.medium.rawValue
+
+    private var size: SidebarIconSize {
+        SidebarIconSize(rawValue: iconSizeRaw) ?? .medium
+    }
+
+    /// The spinner is a control, so it steps between AppKit's control sizes
+    /// rather than scaling continuously with the icons. `.mini` (12pt) matches
+    /// a small symbol closely; `.regular` is 32pt, far past even a large one,
+    /// so large stays on `.small` and only its frame grows.
+    private var spinnerControlSize: ControlSize {
+        size == .small ? .mini : .small
+    }
 
     var body: some View {
         switch state {
@@ -1128,11 +1175,12 @@ private struct TabStatusGlyph: View {
                     .foregroundStyle(.secondary)
                     .help("Running")
             } else {
+                let side = 16 * size.glyphScale
                 ProgressView()
-                    .controlSize(.small)
+                    .controlSize(spinnerControlSize)
                     .tint(.secondary)
                     .help("Running")
-                    .frame(width: 16, height: 16)
+                    .frame(width: side, height: side)
             }
         case .done:
             SidebarRowIcon(symbol: symbol, index: index, agent: agent)
@@ -1140,16 +1188,18 @@ private struct TabStatusGlyph: View {
                 .overlay(alignment: .bottomTrailing) {
                     // Opaque (not translucent) so it reads clearly over the
                     // icon and the sidebar background. Nested in a background
-                    // ring so it stays legible over any icon color.
+                    // ring so it stays legible over any icon color. Sized off
+                    // the icon so the dot keeps hugging its corner at every
+                    // icon size instead of floating away from a smaller glyph.
                     Circle()
                         .fill(.background)
-                        .frame(width: 7, height: 7)
+                        .frame(width: 7 * size.glyphScale, height: 7 * size.glyphScale)
                         .overlay(
                             Circle()
                                 .fill(MactermTheme.success)
-                                .frame(width: 5, height: 5)
+                                .frame(width: 5 * size.glyphScale, height: 5 * size.glyphScale)
                         )
-                        .offset(x: 2.5, y: 2.5)
+                        .offset(x: 2.5 * size.glyphScale, y: 2.5 * size.glyphScale)
                 }
                 .help("Done")
         case .idle:
@@ -1171,6 +1221,7 @@ private extension AgentIcon {
         case .codex: Color(red: 0xAB / 255, green: 0xAB / 255, blue: 0xAB / 255) // OpenAI light gray
         case .gemini: Color(red: 0x42 / 255, green: 0x85 / 255, blue: 0xF4 / 255) // Google blue
         case .copilot: Color(red: 0x89 / 255, green: 0x57 / 255, blue: 0xE5 / 255) // GitHub purple
+        case .antigravity: Color(red: 0x31 / 255, green: 0x86 / 255, blue: 0xFF / 255) // Google Antigravity blue
         case .opencode,
              .cursor,
              .grok,
@@ -1183,26 +1234,48 @@ private struct SidebarRowIcon: View {
     let symbol: String
     let index: Int
     var agent: AgentIcon?
+    @AppStorage(Preferences.Keys.sidebarIconSize)
+    private var iconSizeRaw = SidebarIconSize.medium.rawValue
     /// Scales with the user's text size like the sibling SF Symbols do; a
     /// fixed 15pt would stay small next to enlarged row text.
     @ScaledMetric(relativeTo: .body)
     private var agentIconSize: CGFloat = 15
+
+    private var size: SidebarIconSize {
+        SidebarIconSize(rawValue: iconSizeRaw) ?? .medium
+    }
 
     var body: some View {
         if let agent {
             // A live AI agent in the tab overrides the user's chosen icon —
             // the logo is a status signal, tinted with the agent's brand color
             // (overriding the row's .secondary tint).
+            let side = agentIconSize * size.glyphScale
             Image(agent.rawValue)
                 .renderingMode(.template)
                 .resizable()
                 .scaledToFit()
-                .frame(width: agentIconSize, height: agentIconSize)
+                .frame(width: side, height: side)
                 .foregroundStyle(agent.brandColor)
         } else if Preferences.numberIconChoices.contains(symbol) {
-            NumberGlyph(index: index, variant: symbol)
+            NumberGlyph(index: index, variant: symbol, size: size)
         } else {
             Image(systemName: symbol)
+                .imageScale(size.imageScale)
+        }
+    }
+}
+
+private extension SidebarIconSize {
+    /// SwiftUI's own symbol scaling, which sizes a symbol against whatever font
+    /// the row hands it. `medium` is the default, so the middle case leaves an
+    /// icon exactly the size it was before this preference existed rather than
+    /// pinning it to a point size of our own.
+    var imageScale: Image.Scale {
+        switch self {
+        case .small: .small
+        case .medium: .medium
+        case .large: .large
         }
     }
 }
@@ -1210,18 +1283,29 @@ private struct SidebarRowIcon: View {
 private struct NumberGlyph: View {
     let index: Int
     let variant: String
+    var size: SidebarIconSize = .medium
+    /// The `.body` point size, as a metric so the digits keep tracking the
+    /// user's text size once `glyphScale` has been applied — `imageScale` is
+    /// no help here, since these variants draw text rather than a symbol.
+    @ScaledMetric(relativeTo: .body)
+    private var bodyFontSize: CGFloat = 13
+
+    private var digitFont: Font {
+        .system(size: bodyFontSize * size.glyphScale).monospacedDigit()
+    }
 
     var body: some View {
         if variant == Preferences.numberIconPlain {
             Text("\(index)")
-                .font(.body.monospacedDigit())
+                .font(digitFont)
         } else if let suffix = shapeSuffix, (1 ... 50).contains(index) {
             // SF Symbols ships `1.<shape>` through `50.<shape>`; beyond that,
             // fall back to plain digits so we don't render a missing glyph.
             Image(systemName: "\(index).\(suffix)")
+                .imageScale(size.imageScale)
         } else {
             Text("\(index)")
-                .font(.body.monospacedDigit())
+                .font(digitFont)
         }
     }
 

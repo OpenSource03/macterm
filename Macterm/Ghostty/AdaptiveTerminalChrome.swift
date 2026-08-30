@@ -30,9 +30,15 @@ final class AdaptiveTerminalChrome {
     static let shared = AdaptiveTerminalChrome()
 
     private var stabilizers: [UUID: AdaptiveTerminalBackgroundStabilizer] = [:]
+    /// When each pane last emitted a pty output heartbeat, which is what makes
+    /// a frame attributable to the program rather than to a viewer repaint.
+    private var lastOutputAt: [UUID: Date] = [:]
     private var sampleTimer: Timer?
     private var retryTimer: Timer?
     private var samplingBurst = AdaptiveTerminalSamplingBurst()
+    /// The window the paint regions were last published to, so a window that
+    /// stops carrying painted panes gets its tint back.
+    private weak var lastPaintRegionWindow: NSWindow?
 
     private init() {}
 
@@ -51,8 +57,13 @@ final class AdaptiveTerminalChrome {
     func preferenceDidDisable() {
         cancelTimers()
         stabilizers.removeAll()
+        lastOutputAt.removeAll()
+        let windows = Set(GhosttyTerminalNSView.allLiveViews().compactMap(\.window))
         for view in GhosttyTerminalNSView.allLiveViews() {
             clearPresentation(of: view)
+        }
+        for window in windows {
+            WindowAppearance.updateTerminalPaintRegions(in: window, rects: [])
         }
         GhosttyApp.shared.adoptAdaptiveBackgroundColor(nil)
     }
@@ -75,6 +86,10 @@ final class AdaptiveTerminalChrome {
     /// PTY output heartbeat reliably covers TUI startup and redraws. A short
     /// burst lets Metal publish the finished frame before the final sample.
     func terminalDidOutput(_ view: GhosttyTerminalNSView) {
+        // Recorded before the eligibility guard: output is output whether or
+        // not the pane is on screen right now, and a pane that outputs just
+        // before it becomes visible should still count as freshly written to.
+        lastOutputAt[view.paneID] = Date()
         guard shouldHandleEvent(from: view) else { return }
         requestSamplingBurst(delay: 0.12, retries: 2)
     }
@@ -131,6 +146,7 @@ final class AdaptiveTerminalChrome {
             updateRetryTimer(isNeeded: shouldContinueBurst)
             return
         }
+        defer { lastPaintRegionWindow = views.first?.window }
 
         let needsVerification = views.map(sample).contains(true)
         refreshPresentation(for: views)
@@ -154,10 +170,44 @@ final class AdaptiveTerminalChrome {
             return false
         }
 
+        var paintedBounds: CGRect?
         let candidate: NSColor? = if let surface = view.layer?.contents as? IOSurface {
-            effectiveCandidate(AdaptiveTerminalBackgroundDetector.dominantColor(in: surface)?.color)
+            effectiveCandidate(
+                AdaptiveTerminalBackgroundDetector.dominantColor(
+                    in: surface,
+                    // A painted cell lands at the window opacity when the user
+                    // runs `background-opacity-cells`, so a fixed near-255 floor
+                    // would reject every TUI background such a window ever
+                    // draws — the pane keeps its color and the chrome never
+                    // learns about it.
+                    minimumAlpha: AdaptiveTerminalBackgroundDetector.minimumPaintedAlpha(
+                        windowOpacity: Preferences.shared.windowOpacity
+                    )
+                ).map { match in
+                    paintedBounds = match.paintedUnitBounds
+                    return match.color(in: view.surfaceColorSpace)
+                }
+            )
         } else {
             nil
+        }
+
+        guard AdaptiveTerminalInferenceGate.allowsObservation(
+            ofColor: candidate != nil,
+            hasViewerOverlay: view.hasViewerOverlay,
+            hasConfirmedColor: stabilizer.hasConfirmedColor,
+            secondsSinceOutput: lastOutputAt[id].map { Date().timeIntervalSince($0) }
+        )
+        else {
+            // Frozen, not cleared: the screen model behind the overlay is
+            // unchanged, so the pane keeps exactly what it was presenting. Any
+            // half-confirmed observation is kept too — it matches again once
+            // the frame is trustworthy. No verification retry is asked for,
+            // which is what stops a held selection from driving a 4 Hz timer
+            // for as long as the user leaves it up; the render event that
+            // accompanies dropping the overlay restarts sampling.
+            stabilizers[id] = stabilizer
+            return false
         }
 
         let change = stabilizer.observe(candidate)
@@ -165,25 +215,73 @@ final class AdaptiveTerminalChrome {
         switch change {
         case .applyColor:
             view.sampledDominantBackgroundColor = candidate
+            view.sampledPaintedUnitBounds = paintedBounds
         case .clear:
             view.sampledDominantBackgroundColor = nil
+            view.sampledPaintedUnitBounds = nil
         case nil:
-            break
+            // A confirmed color that has not changed still moves with the pane:
+            // a resize or a redraw shifts where the paint sits even when its
+            // color is identical.
+            if view.sampledDominantBackgroundColor != nil, paintedBounds != nil {
+                view.sampledPaintedUnitBounds = paintedBounds
+            }
         }
         return stabilizer.hasPendingObservation
     }
 
     private func refreshPresentation(for views: [GhosttyTerminalNSView]) {
         let candidates = views.map(currentCandidate)
-        // Every detected color fills its pane opaquely, including a lone pane.
-        // The window-wide tint follows window opacity, so without this fill a
-        // translucent seam would remain around the TUI's opaque pixels.
+        let window = views.first?.window
+        // The quick terminal is a transient overlay in front of the window
+        // that owns the app-wide tint. Its panes still get their own adaptive
+        // fills, but the window-level state of the window underneath is frozen
+        // while it is up: adopting from the panel would repaint that window in
+        // the panel's color (or, for a plain shell, strip its tint), and its
+        // paint-region holes have to stay with the tint they were cut from.
+        let isOverlayPanel = window is NSPanel
+        // An opaquely painted color fills its pane opaquely, including a lone
+        // pane: the window-wide tint follows window opacity, so without the
+        // fill a translucent seam would remain around the TUI's opaque pixels.
+        // A color the TUI itself painted translucently (the user's
+        // `background-opacity-cells`) needs no fill — it is already carrying
+        // the window opacity, and backing it with a solid slab would make the
+        // pane the one opaque thing in a translucent window.
         for (view, color) in zip(views, candidates) {
-            view.presentAdaptivePaneBackground(color)
+            view.presentAdaptivePaneBackground(color.flatMap(Self.paneFill))
         }
+        // Where a terminal paints its own translucent background, the window's
+        // tinted backdrop under it is a second layer of the same color: the
+        // pane composites to `1-(1-opacity)²` while the chrome stays at plain
+        // `opacity`, which reads as the TUI being far more solid than the app
+        // around it. Hand those regions to the backdrop so it cuts its tint
+        // there and both surfaces carry exactly one tinted layer.
+        if let previous = lastPaintRegionWindow, previous !== window, !isOverlayPanel {
+            WindowAppearance.updateTerminalPaintRegions(in: previous, rects: [])
+        }
+        WindowAppearance.updateTerminalPaintRegions(
+            in: window,
+            rects: zip(views, candidates).compactMap { view, color in
+                guard let color, Self.paneFill(color) == nil, let rect = view.sampledPaintedRect
+                else { return nil }
+                return view.convert(rect, to: nil)
+            }
+        )
         // A lone pane can lend its color to the whole window. In a split, each
         // color stays pane-local and the configured background owns the chrome.
-        GhosttyApp.shared.adoptAdaptiveBackgroundColor(candidates.count == 1 ? candidates[0] : nil)
+        // The tint is the pure hue: `WindowAppearance` composites it at the
+        // window opacity itself.
+        guard !isOverlayPanel else { return }
+        GhosttyApp.shared.adoptAdaptiveBackgroundColor(
+            candidates.count == 1 ? candidates[0]?.withAlphaComponent(1) : nil
+        )
+    }
+
+    /// The pane-local fill for a detected color, or nil when the terminal
+    /// already painted that color at the window opacity and the pane should be
+    /// left exactly as the renderer drew it.
+    static func paneFill(_ color: NSColor) -> NSColor? {
+        color.alphaComponent >= 0.999 ? color : nil
     }
 
     private func currentCandidate(for view: GhosttyTerminalNSView) -> NSColor? {
@@ -263,10 +361,12 @@ final class AdaptiveTerminalChrome {
     private func pruneState(keeping views: [GhosttyTerminalNSView]) {
         let active = Set(views.map(\.paneID))
         stabilizers = stabilizers.filter { active.contains($0.key) }
+        lastOutputAt = lastOutputAt.filter { active.contains($0.key) }
     }
 
     private func clearPresentation(of view: GhosttyTerminalNSView) {
         view.sampledDominantBackgroundColor = nil
+        view.sampledPaintedUnitBounds = nil
         view.presentAdaptivePaneBackground(nil)
     }
 
