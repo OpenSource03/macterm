@@ -256,6 +256,7 @@ One `XxxTests.swift` per production type, mirroring the source path. `@testable 
 - **Always use native SwiftUI/AppKit components.** Never mimic native behavior with custom implementations. If a native component has a limitation, accept it rather than building a workaround.
 - All colors come from `MactermTheme` (derived from the ghostty theme config). No hardcoded colors.
 - Minimum target is macOS 14; the liquid glass appearance is a macOS 26 (Tahoe) enhancement, gated so older systems fall back to native materials/blur. Gate any new Tahoe-only API behind `#available(macOS 26.0, *)` and, for user-facing controls, `WindowAppearance.glassSupported`.
+- **Overlay-sidebar spacing and blur are separate layers.** The transparent top `safeAreaBar` reserves titlebar space; `SidebarTopBlurBar` must stay above scrolling rows and remain non-interactive. `scrollEdgeEffectStyle` alone does not create visible top blur outside the native split-view sidebar.
 
 ### Terminal Surface Rules
 

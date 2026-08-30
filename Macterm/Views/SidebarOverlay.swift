@@ -7,6 +7,7 @@ struct SidebarOverlayPanel: View {
     let width: CGFloat
     let chromeHidden: Bool
     let windowCornerRadius: CGFloat?
+    let windowTopSafeAreaInset: CGFloat
     let presentation: SidebarPresentationState
     let isInteractive: Bool
     let onResize: (CGFloat) -> Void
@@ -23,12 +24,22 @@ struct SidebarOverlayPanel: View {
         SidebarContent(
             presentation: presentation,
             isInteractive: isInteractive,
-            paintsFallbackFooterBackground: false
+            paintsFallbackFooterBackground: false,
+            forcesScrollEdgeEffects: true,
+            topSafeAreaBarHeight: chromeHidden
+                ? 0
+                : SidebarLayoutMetrics.overlayTopBarHeight(windowTopInset: windowTopSafeAreaInset)
         )
         .safeAreaPadding(.top, chromeHidden ? SidebarOverlayMetrics.panelInset : 0)
         .safeAreaPadding(.bottom, SidebarOverlayMetrics.panelInset)
         .frame(width: width)
         .frame(maxHeight: .infinity)
+        .ignoresSafeArea(chromeHidden ? [] : .container, edges: .top)
+        .mask {
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                .padding(.vertical, SidebarOverlayMetrics.panelInset)
+                .ignoresSafeArea(.container, edges: .vertical)
+        }
         .background {
             SidebarOverlayBackground(cornerRadius: cornerRadius)
                 .padding(.vertical, SidebarOverlayMetrics.panelInset)
@@ -47,6 +58,69 @@ struct SidebarOverlayPanel: View {
             .frame(width: SplitDividerMetrics.bandThickness)
         }
         .padding(.leading, SidebarOverlayMetrics.panelInset)
+    }
+}
+
+/// Pure decisions at the AppKit/SwiftUI boundary. Keeping these outside
+/// `MainWindow` lets interaction regressions be exercised without synthesizing
+/// system pointer events, which macOS gates behind Accessibility permission.
+@MainActor
+enum SidebarPeekInteraction {
+    struct LaunchResolution: Equatable {
+        let columnVisible: Bool
+        let modelVisible: Bool?
+    }
+
+    struct RetentionContext {
+        let appIsActive: Bool
+        let windowIsVisible: Bool
+        let windowIsMiniaturized: Bool
+        let windowIsKey: Bool
+        let peekEnabled: Bool
+        let configuredStyle: SidebarPeekStyle
+        let menuTrackingDepth: Int
+        let pressedMouseButtons: Int
+        let pointerIsRetained: Bool
+    }
+
+    static func launchResolution(nativeVisible: Bool, modelVisible: Bool) -> LaunchResolution {
+        LaunchResolution(
+            columnVisible: nativeVisible,
+            modelVisible: nativeVisible == modelVisible ? nil : nativeVisible
+        )
+    }
+
+    static func shouldBeginHover(
+        style: SidebarPeekStyle,
+        pointX: CGFloat,
+        previousX: CGFloat?
+    ) -> Bool {
+        switch style {
+        case .resizeTerminal:
+            pointX <= SidebarOverlayMetrics.hoverActivationWidth
+        case .overlayTerminal:
+            SidebarOverlayMetrics.shouldBeginHover(pointX: pointX, previousX: previousX)
+        }
+    }
+
+    static func shouldPromoteOverlay(activeStyle: SidebarPeekStyle?, columnVisible: Bool) -> Bool {
+        activeStyle == .overlayTerminal && columnVisible
+    }
+
+    static func shouldRetainOverlay(_ context: RetentionContext) -> Bool {
+        let interactionOwnsPointer = context.menuTrackingDepth > 0
+            || (context.pressedMouseButtons & 1) != 0
+        return context.appIsActive
+            && context.windowIsVisible
+            && !context.windowIsMiniaturized
+            && context.peekEnabled
+            && context.configuredStyle == .overlayTerminal
+            && (interactionOwnsPointer || (context.windowIsKey && context.pointerIsRetained))
+    }
+
+    static func shouldCollapseAfterResize(lastHoverX: CGFloat?, sidebarWidth: CGFloat) -> Bool {
+        guard let lastHoverX else { return false }
+        return lastHoverX > sidebarWidth + SidebarOverlayMetrics.hoverExitPadding
     }
 }
 
@@ -107,6 +181,10 @@ enum SidebarOverlayMetrics {
     static func resizedWidth(start: CGFloat, delta: CGFloat) -> CGFloat {
         let range = Preferences.sidebarWidthRange
         return min(max(start + delta, CGFloat(range.lowerBound)), CGFloat(range.upperBound))
+    }
+
+    static func topObscuredInset(contentFrameInWindow: CGRect, contentLayoutRect: CGRect) -> CGFloat {
+        max(contentFrameInWindow.maxY - contentLayoutRect.maxY, 0)
     }
 }
 

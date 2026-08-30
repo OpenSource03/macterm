@@ -8,9 +8,44 @@ import UniformTypeIdentifiers
 /// trailing inset at its root so all of them stop at the same edge.
 private let rowTrailingInset: CGFloat = 10
 
+@MainActor
+enum SidebarLayoutMetrics {
+    static let topContentMargin: CGFloat = 4
+    static let idlePinDropHeight: CGFloat = 8
+
+    static func overlayTopBarHeight(windowTopInset: CGFloat) -> CGFloat {
+        max(windowTopInset - topContentMargin - idlePinDropHeight, 0)
+    }
+
+    static func overlayTopBlurHeight(topBarHeight: CGFloat) -> CGFloat {
+        topBarHeight + topContentMargin + idlePinDropHeight
+    }
+}
+
 /// Keeps the sidebar footer above scrolling rows, using the native macOS 26
 /// scroll-edge fade when available.
 private extension View {
+    @ViewBuilder
+    func sidebarTopSafeAreaBar(height: CGFloat) -> some View {
+        if height > 0 {
+            if #available(macOS 26.0, *) {
+                safeAreaBar(edge: .top, spacing: 0) {
+                    Color.clear
+                        .frame(height: height)
+                        .allowsHitTesting(false)
+                }
+            } else {
+                safeAreaInset(edge: .top, spacing: 0) {
+                    Color.clear
+                        .frame(height: height)
+                        .allowsHitTesting(false)
+                }
+            }
+        } else {
+            self
+        }
+    }
+
     @ViewBuilder
     func sidebarSafeAreaBar(
         isPresented: Bool,
@@ -33,6 +68,37 @@ private extension View {
         } else {
             self
         }
+    }
+
+    @ViewBuilder
+    func sidebarScrollEdgeEffects(enabled: Bool) -> some View {
+        if enabled {
+            if #available(macOS 26.0, *) {
+                scrollEdgeEffectStyle(.soft, for: .bottom)
+            } else {
+                self
+            }
+        } else {
+            self
+        }
+    }
+}
+
+private struct SidebarTopBlurBar: View {
+    let height: CGFloat
+
+    var body: some View {
+        Rectangle()
+            .fill(.regularMaterial)
+            .mask {
+                LinearGradient(
+                    colors: [.black, .black.opacity(0.9), .clear],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+            }
+            .frame(height: height)
+            .allowsHitTesting(false)
     }
 }
 
@@ -134,15 +200,21 @@ struct SidebarContent: View {
     private var presentation: SidebarPresentationState
     private let isInteractive: Bool
     private let paintsFallbackFooterBackground: Bool
+    private let forcesScrollEdgeEffects: Bool
+    private let topSafeAreaBarHeight: CGFloat
 
     init(
         presentation: SidebarPresentationState,
         isInteractive: Bool,
-        paintsFallbackFooterBackground: Bool = true
+        paintsFallbackFooterBackground: Bool = true,
+        forcesScrollEdgeEffects: Bool = false,
+        topSafeAreaBarHeight: CGFloat = 0
     ) {
         self.presentation = presentation
         self.isInteractive = isInteractive
         self.paintsFallbackFooterBackground = paintsFallbackFooterBackground
+        self.forcesScrollEdgeEffects = forcesScrollEdgeEffects
+        self.topSafeAreaBarHeight = topSafeAreaBarHeight
     }
 
     var body: some View {
@@ -212,6 +284,9 @@ struct SidebarContent: View {
         }
         .listStyle(.sidebar)
         .scrollContentBackground(.hidden)
+        .contentMargins(.top, SidebarLayoutMetrics.topContentMargin, for: .scrollContent)
+        .sidebarTopSafeAreaBar(height: topSafeAreaBarHeight)
+        .sidebarScrollEdgeEffects(enabled: forcesScrollEdgeEffects)
         .scrollPosition(id: Binding(
             get: { presentation.scrollPosition },
             set: { position in
@@ -295,6 +370,13 @@ struct SidebarContent: View {
         .onAppear {
             if let id = appState.activeProjectID { presentation.expandedProjects.insert(id) }
             syncSelection()
+        }
+        .overlay(alignment: .top) {
+            if topSafeAreaBarHeight > 0 {
+                SidebarTopBlurBar(
+                    height: SidebarLayoutMetrics.overlayTopBlurHeight(topBarHeight: topSafeAreaBarHeight)
+                )
+            }
         }
     }
 
@@ -1069,7 +1151,7 @@ private struct PinTabDropZone: View {
             }
         }
         .frame(maxWidth: .infinity)
-        .frame(height: isBandVisible ? 38 : 12)
+        .frame(height: isBandVisible ? 38 : SidebarLayoutMetrics.idlePinDropHeight)
         .contentShape(Rectangle())
         .dropDestination(for: TabSlotDropItem.self) { items, _ in
             for item in items {

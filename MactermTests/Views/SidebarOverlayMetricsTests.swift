@@ -81,6 +81,30 @@ struct SidebarOverlayMetricsTests {
     }
 
     @Test
+    func titlebar_inset_uses_the_non_obscured_window_layout_rect() {
+        let contentFrame = CGRect(x: 0, y: 0, width: 1000, height: 800)
+
+        #expect(SidebarOverlayMetrics.topObscuredInset(
+            contentFrameInWindow: contentFrame,
+            contentLayoutRect: CGRect(x: 0, y: 0, width: 1000, height: 748)
+        ) == 52)
+        #expect(SidebarOverlayMetrics.topObscuredInset(
+            contentFrameInWindow: contentFrame,
+            contentLayoutRect: CGRect(x: 0, y: 0, width: 1000, height: 800)
+        ) == 0)
+    }
+
+    @Test
+    func overlay_top_bar_and_shared_spacing_sum_to_the_window_inset() {
+        let inset: CGFloat = 52
+        let bar = SidebarLayoutMetrics.overlayTopBarHeight(windowTopInset: inset)
+
+        #expect(bar == 40)
+        #expect(bar + SidebarLayoutMetrics.topContentMargin + SidebarLayoutMetrics.idlePinDropHeight == inset)
+        #expect(SidebarLayoutMetrics.overlayTopBlurHeight(topBarHeight: bar) == inset)
+    }
+
+    @Test
     func native_handoff_ignores_stale_animation_widths_until_target_arrives() {
         var handoff = SidebarWidthHandoff(width: 180)
         #expect(handoff.overlayResized(to: 260) == 260)
