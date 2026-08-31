@@ -628,6 +628,8 @@ struct MainWindow: View {
     private func scheduleOverlayWindowExit() {
         guard overlayWindowExitTask == nil else { return }
         overlayWindowExitTask = Task { @MainActor in
+            var lastPointer: CGPoint?
+            var stationaryTicks = 0
             while !Task.isCancelled {
                 guard isOverlayPeeking, !appState.sidebarVisible, !isResizingOverlay,
                       let window = (NSApp.delegate as? AppDelegate)?.mainWindow
@@ -636,8 +638,17 @@ struct MainWindow: View {
                     return
                 }
 
+                let pointer = NSEvent.mouseLocation
+                if let lastPointer, abs(pointer.x - lastPointer.x) < 0.5,
+                   abs(pointer.y - lastPointer.y) < 0.5
+                {
+                    stationaryTicks += 1
+                } else {
+                    stationaryTicks = 0
+                }
+                lastPointer = pointer
                 let pointerIsRetained = SidebarOverlayMetrics.retainsOutsidePointer(
-                    NSEvent.mouseLocation,
+                    pointer,
                     windowFrame: window.frame,
                     sidebarWidth: sidebarWidth
                 )
@@ -659,7 +670,15 @@ struct MainWindow: View {
                 }
 
                 do {
-                    try await Task.sleep(for: .milliseconds(33))
+                    // A parked pointer cannot leave the retention region, and
+                    // this region has no time-based dismissal, so a pointer
+                    // resting in it would otherwise wake the main actor 30
+                    // times a second indefinitely. Back off once it has been
+                    // still for ~half a second; any movement snaps the poll
+                    // straight back to the responsive rate.
+                    try await Task.sleep(
+                        for: .milliseconds(stationaryTicks >= 15 ? 500 : 33)
+                    )
                 } catch {
                     return
                 }
