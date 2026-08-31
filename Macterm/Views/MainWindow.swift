@@ -93,6 +93,18 @@ struct MainWindow: View {
     private var isOverlayPeeking: Bool { activePeekStyle == .overlayTerminal }
     private var sidebarWidth: CGFloat { sidebarWidthHandoff.width }
     private var peekStripWidth: CGFloat { SidebarOverlayMetrics.hoverActivationWidth }
+    /// How far in from the leading edge the CONFIGURED style can acquire a
+    /// peek. The overlay's intent-aware corridor is far wider than the strip,
+    /// so `suppressPeekUntilExit` has to be armed and cleared against this —
+    /// against the strip, an explicit hide with the pointer at x=40 armed
+    /// nothing and the smallest leftward move popped the overlay back out.
+    /// For the resize style the two are the same value.
+    private var peekAcquisitionWidth: CGFloat {
+        preferences.sidebarPeekStyle == .overlayTerminal
+            ? SidebarOverlayMetrics.hoverApproachWidth
+            : SidebarOverlayMetrics.hoverActivationWidth
+    }
+
     private var peekExitPadding: CGFloat { SidebarOverlayMetrics.hoverExitPadding }
     private var isNativeSidebarInteractive: Bool {
         appState.sidebarVisible || activePeekStyle == .resizeTerminal
@@ -266,7 +278,7 @@ struct MainWindow: View {
                 scheduleSidebarWidthHandoff()
                 activePeekStyle = nil
             } else if !isInitialReconciliation,
-                      isPeeking || lastHoverPoint.map({ $0.x <= peekStripWidth }) == true
+                      isPeeking || lastHoverPoint.map({ $0.x <= peekAcquisitionWidth }) == true
             {
                 // Hidden by shortcut while peeked out under the pointer: don't
                 // let the very next hover event pop it straight back open.
@@ -432,7 +444,7 @@ struct MainWindow: View {
                 return
             }
             if suppressPeekUntilExit {
-                if point.x > peekStripWidth { suppressPeekUntilExit = false }
+                if point.x > peekAcquisitionWidth { suppressPeekUntilExit = false }
                 return
             }
             let shouldBegin = SidebarPeekInteraction.shouldBeginHover(
