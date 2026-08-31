@@ -342,6 +342,10 @@ struct ResizeDragBand: NSViewRepresentable {
         /// state, which wouldn't be guaranteed to have flowed back through
         /// `updateNSView` before the first `mouseDragged` arrives.
         private var startValue: CGFloat = 0
+        /// The press that opened the current drag, kept so a click that never
+        /// became a drag can be handed to the view underneath on release.
+        private var pressEvent: NSEvent?
+        private var didDrag = false
 
         /// Set while resolving what the band is covering, so its own `hitTest`
         /// steps aside and the view underneath answers instead.
@@ -376,11 +380,14 @@ struct ResizeDragBand: NSViewRepresentable {
         override func mouseDown(with event: NSEvent) {
             dragOrigin = event.locationInWindow
             startValue = valueAtDragStart()
+            pressEvent = event
+            didDrag = false
             onResizeStateChanged(true)
         }
 
         override func mouseDragged(with event: NSEvent) {
             guard let dragOrigin else { return }
+            didDrag = true
             let delta = axis.delta(from: dragOrigin, to: event.locationInWindow)
             // Hold the resize cursor for the duration: dragging routinely
             // wanders off the band, and `cursorUpdate` only fires for
@@ -389,8 +396,20 @@ struct ResizeDragBand: NSViewRepresentable {
             onResize(resizedValue(startValue, delta))
         }
 
-        override func mouseUp(with _: NSEvent) {
+        override func mouseUp(with event: NSEvent) {
+            let press = pressEvent
+            let moved = didDrag
             finishResize()
+            // A press that never moved isn't a resize. The band sits ON the
+            // view it covers — for the sidebar overlay that is the row list,
+            // whose trailing points would otherwise be dead to selection — so
+            // hand the click down, the same way scroll and right-click already
+            // go through `viewBeneath`. The release is queued FIRST: a target
+            // that tracks inside `mouseDown` then reads it immediately instead
+            // of blocking on the next event.
+            guard !moved, let press, let target = viewBeneath(press) else { return }
+            NSApp.postEvent(event, atStart: true)
+            target.mouseDown(with: press)
         }
 
         override func viewWillMove(toWindow newWindow: NSWindow?) {
@@ -404,6 +423,8 @@ struct ResizeDragBand: NSViewRepresentable {
         private func finishResize() {
             guard dragOrigin != nil else { return }
             dragOrigin = nil
+            pressEvent = nil
+            didDrag = false
             onResizeStateChanged(false)
         }
 
