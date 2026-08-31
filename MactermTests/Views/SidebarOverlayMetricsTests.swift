@@ -131,4 +131,19 @@ struct SidebarOverlayMetricsTests {
         #expect(handoff.overlayResized(to: 300) == 300)
         #expect(handoff.pendingNativeWidth == nil)
     }
+
+    @Test
+    func an_unreachable_target_is_disarmed_instead_of_discarding_every_width() {
+        var handoff = SidebarWidthHandoff(width: 400)
+        #expect(handoff.beginNativeHandoff() == 400)
+
+        // A narrow window clamps the divider short of the target, so no
+        // measurement will ever match it.
+        #expect(handoff.nativeMeasured(300) == nil)
+
+        handoff.endNativeHandoff()
+        #expect(handoff.pendingNativeWidth == nil)
+        #expect(handoff.nativeMeasured(300) == 300)
+        #expect(handoff.width == 300)
+    }
 }

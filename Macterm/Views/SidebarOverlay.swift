@@ -215,6 +215,17 @@ struct SidebarWidthHandoff {
         pendingNativeWidth = target
         return target
     }
+
+    /// Stop expecting a native measurement to confirm the pending target.
+    ///
+    /// A handoff that was never applied — or that AppKit clamped short of the
+    /// target, which a narrow window does — leaves a value no measurement can
+    /// ever match, and `nativeMeasured` would then discard every native width
+    /// for the rest of the session. Disarming is always safe: the pending
+    /// target only ever holds the current `width`.
+    mutating func endNativeHandoff() {
+        pendingNativeWidth = nil
+    }
 }
 
 private struct SidebarOverlayBackground: View {

@@ -411,17 +411,36 @@ struct MainWindow: View {
             } catch {
                 return
             }
-            sidebarWidthHandoffTask = nil
             guard appState.sidebarVisible || activePeekStyle == .resizeTerminal,
-                  let window = (NSApp.delegate as? AppDelegate)?.mainWindow
-            else { return }
-            _ = WindowAppearance.setSidebarWidth(targetWidth, window: window)
+                  let window = (NSApp.delegate as? AppDelegate)?.mainWindow,
+                  WindowAppearance.setSidebarWidth(targetWidth, window: window)
+            else {
+                // Nothing applied the target, so nothing will ever measure it.
+                sidebarWidthHandoffTask = nil
+                sidebarWidthHandoff.endNativeHandoff()
+                return
+            }
+            // AppKit can settle short of the target — a narrow window clamps
+            // the divider — and no later measurement would match it. Give the
+            // geometry hook one settle window to confirm, then disarm anyway.
+            do {
+                try await Task.sleep(for: .seconds(peekAnimationDuration))
+            } catch {
+                return
+            }
+            sidebarWidthHandoffTask = nil
+            sidebarWidthHandoff.endNativeHandoff()
         }
     }
 
     private func cancelSidebarWidthHandoff() {
         sidebarWidthHandoffTask?.cancel()
         sidebarWidthHandoffTask = nil
+        // An abandoned handoff must not keep rejecting native measurements.
+        // `scheduleSidebarWidthHandoff` re-arms straight after cancelling, and
+        // the pending target only ever holds the current width, so re-arming
+        // reproduces the same value.
+        sidebarWidthHandoff.endNativeHandoff()
     }
 
     /// Hover-peek for the hidden sidebar. The resize style uses the native
